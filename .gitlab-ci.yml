@@ -29,6 +29,8 @@ include: "https://gitlab.freedesktop.org/gstreamer/gst-ci/raw/master/gitlab/ci_t
       python3-setuptools
       python3-wheel
       xz-utils
+      libspandsp-dev
+
   before_script:
     - apt-get update -yqq
     - apt-get install -yqq --no-install-recommends $DEPENDENCIES

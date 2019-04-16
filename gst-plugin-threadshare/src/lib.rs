@@ -40,6 +40,7 @@ mod inputselector;
 mod jitterbuffer;
 mod proxy;
 mod queue;
+mod tonesrc;
 
 use glib::translate::*;
 use glib_sys as glib_ffi;
@@ -58,6 +59,7 @@ fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     appsrc::register(plugin)?;
     jitterbuffer::jitterbuffer::register(plugin)?;
     inputselector::register(plugin)?;
+    tonesrc::register(plugin)?;
 
     Ok(())
 }
