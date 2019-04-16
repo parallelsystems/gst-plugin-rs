@@ -16,6 +16,7 @@ glib = { git = "https://github.com/gtk-rs/glib" }
 gio = { git = "https://github.com/gtk-rs/gio" }
 gst = { package = "gstreamer", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs", features=["v1_10"] }
 gst-app = { package = "gstreamer-app", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
+gst-audio = { package = "gstreamer-audio", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
 gst-check = { package = "gstreamer-check", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
 gst-net = { package = "gstreamer-net", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
 gst-rtp = { package = "gstreamer-rtp", git = "https://gitlab.freedesktop.org/gstreamer/gstreamer-rs" }
@@ -27,6 +28,8 @@ lazy_static = "1.0"
 either = "1.0"
 rand = "0.7"
 net2 = "0.2"
+muldiv = "0.2"
+byte-slice-cast = "0.2"
 # Pin quote to 1.0.2 until https://github.com/rust-lang-nursery/failure/issues/342 is fixed.
 quote = "=1.0.2"
 
