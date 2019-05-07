@@ -109,6 +109,68 @@ fn encrypt_file() {
 }
 
 #[test]
+fn test_querries() {
+    init();
+
+    let input = include_bytes!("sample.mp3");
+    let expected_output = include_bytes!("encrypted_sample.enc");
+
+    let mut adapter = gst_base::UniqueAdapter::new();
+
+    let enc = gst::ElementFactory::make("rssodiumencrypter", None).unwrap();
+    enc.set_property("sender-key", &*SENDER_PRIVATE)
+        .expect("failed to set property");
+    enc.set_property("receiver-key", &*RECEIVER_PUBLIC)
+        .expect("failed to set property");
+    enc.set_property("block-size", &1024u32)
+        .expect("failed to set property");
+
+    let mut h = gst_check::Harness::new_with_element(&enc, None, None);
+    h.add_element_src_pad(&enc.get_static_pad("src").expect("failed to get src pad"));
+    h.add_element_sink_pad(&enc.get_static_pad("sink").expect("failed to get src pad"));
+    h.set_src_caps_str("application/x-sodium-encrypted");
+
+    let buf = gst::Buffer::from_mut_slice(Vec::from(&input[..]));
+
+    assert_eq!(h.push(buf), Ok(gst::FlowSuccess::Ok));
+    h.push_event(gst::Event::new_eos().build());
+
+    // Query position at 0
+    let q1 = enc.query_position::<gst::format::Bytes>().unwrap();
+    assert_eq!(gst::format::Bytes(Some(0)), q1);
+
+    // Query position after a buffer pull
+    let buf1 = h.pull().unwrap();
+    let s1 = buf1.get_size() as u64;
+    let q1 = enc.query_position::<gst::format::Bytes>().unwrap();
+    assert_eq!(gst::format::Bytes(Some(s1)), q1);
+    adapter.push(buf1);
+
+    // Query position after 2 buffer pulls
+    let buf2 = h.pull().unwrap();
+    let s2 = buf2.get_size() as u64;
+    let q2 = enc.query_position::<gst::format::Bytes>().unwrap();
+    // query pos == b1 + b2 len()
+    assert_eq!(gst::format::Bytes(Some(s1 + s2)), q2);
+    adapter.push(buf2);
+
+    while let Some(buf) = h.pull() {
+        adapter.push(buf);
+        if adapter.available() >= expected_output.len() {
+            break;
+        }
+    }
+
+    // Query position at eos
+    let q_eos = enc.query_position::<gst::format::Bytes>().unwrap();
+    assert_eq!(
+        gst::format::Bytes(Some(expected_output.len() as u64)),
+        q_eos
+    );
+    assert_eq!(gst::format::Bytes(Some(adapter.available() as u64)), q_eos);
+}
+
+#[test]
 fn test_state_changes() {
     init();
 

@@ -389,8 +389,8 @@ impl Encrypter {
                     }
                 };
 
-                let state = self.state.lock().unwrap();
-                let state = match state.as_ref() {
+                let state_mutex = self.state.lock().unwrap();
+                let state = match state_mutex.as_ref() {
                     // If state isn't set, it means that the
                     // element hasn't been activated yet.
                     None => return false,
@@ -408,6 +408,44 @@ impl Encrypter {
                 gst_debug!(CAT, obj: pad, "Setting duration bytes: {}", size);
                 q.set(gst::format::Bytes::from(size));
 
+                true
+            }
+            QueryView::Position(ref mut q) => {
+                if q.get_format() != gst::Format::Bytes {
+                    return pad.query_default(element, query);
+                }
+
+                /* First let's query the bytes duration upstream */
+                let mut q = gst::query::Query::new_position(gst::Format::Bytes);
+
+                if !self.sinkpad.peer_query(&mut q) {
+                    gst_error!(CAT, "Failed to query upstream duration");
+                    return false;
+                }
+
+                let position = match q.get_result().try_into_bytes().unwrap() {
+                    gst::format::Bytes(Some(size)) => size,
+                    gst::format::Bytes(None) => {
+                        gst_error!(CAT, "Failed to query upstream duration");
+
+                        return false;
+                    }
+                };
+
+                let state_mutex = self.state.lock().unwrap();
+                let state = match state_mutex.as_ref() {
+                    // If state isn't set, it means that the
+                    // element hasn't been activated yet.
+                    None => return false,
+                    Some(s) => s,
+                };
+
+                dbg!(position);
+                let chunk_index = position as u64 / state.block_size as u64;
+                let position =
+                    position + (chunk_index * box_::MACBYTES as u64) + super::HEADERS_SIZE as u64;
+
+                q.set(gst::format::Bytes::from(position));
                 true
             }
             _ => pad.query_default(element, query),
