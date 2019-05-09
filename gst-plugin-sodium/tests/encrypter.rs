@@ -29,6 +29,9 @@ extern crate gstrssodium;
 use glib::prelude::*;
 use gst::prelude::*;
 
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
 lazy_static! {
     static ref RECEIVER_PUBLIC: glib::Bytes = {
         let public = [
@@ -109,65 +112,102 @@ fn encrypt_file() {
 }
 
 #[test]
-fn test_querries() {
+fn test_queries() {
     init();
 
-    let input = include_bytes!("sample.mp3");
-    let expected_output = include_bytes!("encrypted_sample.enc");
+    let input_path = {
+        let mut r = PathBuf::new();
+        r.push(env!("CARGO_MANIFEST_DIR"));
+        r.push("tests");
+        r.push("sample");
+        r.set_extension("mp3");
+        r
+    };
 
-    let mut adapter = gst_base::UniqueAdapter::new();
-
+    let pipeline = gst::Pipeline::new(None);
+    let src = gst::ElementFactory::make("filesrc", None).unwrap();
+    src.set_property("location", &input_path.to_str().unwrap())
+        .unwrap();
     let enc = gst::ElementFactory::make("rssodiumencrypter", None).unwrap();
+    let sink = gst::ElementFactory::make("appsink", None).unwrap();
     enc.set_property("sender-key", &*SENDER_PRIVATE)
         .expect("failed to set property");
     enc.set_property("receiver-key", &*RECEIVER_PUBLIC)
         .expect("failed to set property");
     enc.set_property("block-size", &1024u32)
         .expect("failed to set property");
+    pipeline.add_many(&[&src, &enc, &sink]).unwrap();
+    src.link_pads(Some("src"), &enc, Some("sink")).unwrap();
+    enc.link_pads(Some("src"), &sink, Some("sink")).unwrap();
+    let sink = sink.downcast::<gst_app::AppSink>().unwrap();
 
-    let mut h = gst_check::Harness::new_with_element(&enc, None, None);
-    h.add_element_src_pad(&enc.get_static_pad("src").expect("failed to get src pad"));
-    h.add_element_sink_pad(&enc.get_static_pad("sink").expect("failed to get src pad"));
-    h.set_src_caps_str("application/x-sodium-encrypted");
+    let adapter = Arc::new(Mutex::new(gst_base::UniqueAdapter::new()));
 
-    let buf = gst::Buffer::from_mut_slice(Vec::from(&input[..]));
+    let adapter_clone = adapter.clone();
+    let enc_clone = enc.clone();
+    sink.set_callbacks(
+        gst_app::AppSinkCallbacks::new()
+            // Add a handler to the "new-sample" signal.
+            .new_sample(move |appsink| {
+                // Pull the sample in question out of the appsink's buffer.
+                let sample = appsink.pull_sample().ok_or(gst::FlowError::Eos)?;
+                let buffer = sample.get_buffer().ok_or(gst::FlowError::Error)?;
 
-    assert_eq!(h.push(buf), Ok(gst::FlowSuccess::Ok));
-    h.push_event(gst::Event::new_eos().build());
+                let mut adapter = adapter_clone.lock().unwrap();
+                adapter.push(buffer.to_owned());
 
-    // Query position at 0
-    let q1 = enc.query_position::<gst::format::Bytes>().unwrap();
-    assert_eq!(gst::format::Bytes(Some(0)), q1);
+                let pos = enc_clone.query_position::<gst::format::Bytes>().unwrap();
+                dbg!(pos);
+                dbg!(adapter.available());
+                assert_eq!(gst::format::Bytes(Some(adapter.available() as u64)), pos);
 
-    // Query position after a buffer pull
-    let buf1 = h.pull().unwrap();
-    let s1 = buf1.get_size() as u64;
-    let q1 = enc.query_position::<gst::format::Bytes>().unwrap();
-    assert_eq!(gst::format::Bytes(Some(s1)), q1);
-    adapter.push(buf1);
+                let dur = enc_clone.query_duration::<gst::format::Bytes>().unwrap();
+                assert_eq!(gst::format::Bytes(Some(6043)), dur);
 
-    // Query position after 2 buffer pulls
-    let buf2 = h.pull().unwrap();
-    let s2 = buf2.get_size() as u64;
-    let q2 = enc.query_position::<gst::format::Bytes>().unwrap();
-    // query pos == b1 + b2 len()
-    assert_eq!(gst::format::Bytes(Some(s1 + s2)), q2);
-    adapter.push(buf2);
+                Ok(gst::FlowSuccess::Ok)
+            })
+            .build(),
+    );
 
-    while let Some(buf) = h.pull() {
-        adapter.push(buf);
-        if adapter.available() >= expected_output.len() {
-            break;
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    let bus = pipeline.get_bus().unwrap();
+    for msg in bus.iter_timed(gst::CLOCK_TIME_NONE) {
+        use gst::MessageView;
+        match msg.view() {
+            MessageView::Error(err) => {
+                eprintln!(
+                    "Error received from element {:?}: {}",
+                    err.get_src().map(|s| s.get_path_string()),
+                    err.get_error()
+                );
+                eprintln!("Debugging information: {:?}", err.get_debug());
+                assert!(true);
+                break;
+            }
+            MessageView::Eos(..) => break,
+            _ => (),
         }
     }
 
-    // Query position at eos
-    let q_eos = enc.query_position::<gst::format::Bytes>().unwrap();
-    assert_eq!(
-        gst::format::Bytes(Some(expected_output.len() as u64)),
-        q_eos
-    );
-    assert_eq!(gst::format::Bytes(Some(adapter.available() as u64)), q_eos);
+    let expected_output = include_bytes!("encrypted_sample.enc");
+    let mut adapter = adapter.lock().unwrap();
+    let available = adapter.available();
+
+    // Query position/duration at eos
+    let pos = enc.query_position::<gst::format::Bytes>().unwrap();
+    assert_eq!(gst::format::Bytes(Some(expected_output.len() as u64)), pos);
+    assert_eq!(gst::format::Bytes(Some(available as u64)), pos);
+
+    let dur = enc.query_duration::<gst::format::Bytes>().unwrap();
+    assert_eq!(gst::format::Bytes(Some(6043)), dur);
+
+    assert_eq!(available, expected_output.len());
+    let output_buffer = adapter.take_buffer(available).unwrap();
+    let output = output_buffer.map_readable().unwrap();
+    assert_eq!(expected_output.as_ref(), output.as_ref());
+
+    pipeline.set_state(gst::State::Null).unwrap();
 }
 
 #[test]

@@ -100,6 +100,7 @@ struct State {
     precomputed_key: box_::PrecomputedKey,
     block_size: u32,
     write_headers: bool,
+    pending_bytes: u64,
 }
 
 impl State {
@@ -153,6 +154,7 @@ impl State {
             nonce,
             block_size: props.block_size,
             write_headers: true,
+            pending_bytes: 0,
         })
     }
 
@@ -183,6 +185,7 @@ impl State {
             let buffer = self.adapter.take_buffer(block_size).unwrap();
             let out_buf = self.encrypt_message(&buffer);
 
+            self.pending_bytes += out_buf.get_size() as u64;
             buffers.push(out_buf);
         }
 
@@ -250,7 +253,9 @@ impl Encrypter {
             // Write the block_size into the stream
             headers.extend_from_slice(&state.block_size.to_le_bytes());
 
-            buffers.push(gst::Buffer::from_mut_slice(headers));
+            let out_buf = gst::Buffer::from_mut_slice(headers);
+            state.pending_bytes += out_buf.get_size() as u64;
+            buffers.push(out_buf);
             state.write_headers = false;
         }
 
@@ -275,10 +280,22 @@ impl Encrypter {
         drop(state_guard);
 
         for buffer in buffers {
+            {
+                let mut state_guard = self.state.lock().unwrap();
+                let state = state_guard.as_mut().unwrap();
+                state.pending_bytes -= buffer.get_size() as u64;
+            }
+
             self.srcpad.push(buffer).map_err(|err| {
                 gst_error!(CAT, obj: element, "Failed to push buffer {:?}", err);
                 err
             })?;
+        }
+
+        {
+            let mut state_guard = self.state.lock().unwrap();
+            let state = state_guard.as_mut().unwrap();
+            assert_eq!(state.pending_bytes, 0);
         }
 
         Ok(gst::FlowSuccess::Ok)
@@ -416,14 +433,14 @@ impl Encrypter {
                 }
 
                 /* First let's query the bytes duration upstream */
-                let mut q = gst::query::Query::new_position(gst::Format::Bytes);
+                let mut peer_query = gst::query::Query::new_position(gst::Format::Bytes);
 
-                if !self.sinkpad.peer_query(&mut q) {
+                if !self.sinkpad.peer_query(&mut peer_query) {
                     gst_error!(CAT, "Failed to query upstream duration");
                     return false;
                 }
 
-                let position = match q.get_result().try_into_bytes().unwrap() {
+                let position = match peer_query.get_result().try_into_bytes().unwrap() {
                     gst::format::Bytes(Some(size)) => size,
                     gst::format::Bytes(None) => {
                         gst_error!(CAT, "Failed to query upstream duration");
@@ -441,11 +458,22 @@ impl Encrypter {
                 };
 
                 dbg!(position);
+                let position = position - state.adapter.available() as u64;
+                dbg!(position);
                 let chunk_index = position as u64 / state.block_size as u64;
+                dbg!(chunk_index);
+                dbg!(state.block_size);
                 let position =
                     position + (chunk_index * box_::MACBYTES as u64) + super::HEADERS_SIZE as u64;
+                dbg!(box_::MACBYTES);
+                dbg!(super::HEADERS_SIZE);
+                dbg!(position);
+                dbg!(state.pending_bytes);
+                let position = position - state.pending_bytes;
+                dbg!(gst::format::Bytes::from(position));
 
                 q.set(gst::format::Bytes::from(position));
+                dbg!(q.get_structure());
                 true
             }
             _ => pad.query_default(element, query),
