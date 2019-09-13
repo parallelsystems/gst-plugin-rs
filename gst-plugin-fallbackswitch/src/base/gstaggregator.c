@@ -91,6 +91,57 @@
 
 #include "gstaggregator.h"
 
+#if !GST_CHECK_VERSION(1,14,0)
+typedef gboolean (*GstElementForeachPadFunc) (GstElement * element,
+                                              GstPad     * pad,
+                                              gpointer     user_data);
+
+static gboolean
+gst_element_do_foreach_pad (GstElement * element,
+    GstElementForeachPadFunc func, gpointer user_data,
+    GList ** p_pads, guint16 * p_npads)
+{
+  gboolean ret = TRUE;
+  GstPad **pads;
+  guint n_pads, i;
+  GList *l;
+
+  g_return_val_if_fail (GST_IS_ELEMENT (element), FALSE);
+  g_return_val_if_fail (func != NULL, FALSE);
+
+  GST_OBJECT_LOCK (element);
+  n_pads = *p_npads;
+  pads = g_newa (GstPad *, n_pads + 1);
+  for (l = *p_pads, i = 0; l != NULL; l = l->next) {
+    g_assert (i < n_pads);
+    pads[i++] = gst_object_ref (l->data);
+  }
+  GST_OBJECT_UNLOCK (element);
+
+  if (n_pads == 0)
+    return FALSE;
+
+  for (i = 0; i < n_pads; ++i) {
+    ret = func (element, pads[i], user_data);
+    if (!ret)
+      break;
+  }
+
+  for (i = 0; i < n_pads; ++i)
+    gst_object_unref (pads[i]);
+
+  return ret;
+}
+
+static gboolean
+gst_element_foreach_sink_pad (GstElement * element,
+    GstElementForeachPadFunc func, gpointer user_data)
+{
+  return gst_element_do_foreach_pad (element, func, user_data,
+      &element->sinkpads, &element->numsinkpads);
+}
+#endif
+
 typedef enum
 {
   GST_AGGREGATOR_START_TIME_SELECTION_ZERO,
@@ -1806,9 +1857,7 @@ gst_aggregator_default_create_new_pad (GstAggregator * self,
   GstAggregatorPrivate *priv = self->priv;
   gint serial = 0;
   gchar *name = NULL;
-  GType pad_type =
-      GST_PAD_TEMPLATE_GTYPE (templ) ==
-      G_TYPE_NONE ? GST_TYPE_AGGREGATOR_PAD : GST_PAD_TEMPLATE_GTYPE (templ);
+  GType pad_type = GST_TYPE_AGGREGATOR_PAD;
 
   if (templ->direction != GST_PAD_SINK)
     goto not_sink;
@@ -2657,10 +2706,7 @@ gst_aggregator_init (GstAggregator * self, GstAggregatorClass * klass)
   self->priv->peer_latency_max = self->priv->sub_latency_max = 0;
   self->priv->has_peer_latency = FALSE;
 
-  pad_type =
-      GST_PAD_TEMPLATE_GTYPE (pad_template) ==
-      G_TYPE_NONE ? GST_TYPE_AGGREGATOR_PAD :
-      GST_PAD_TEMPLATE_GTYPE (pad_template);
+  pad_type = GST_TYPE_AGGREGATOR_PAD;
   g_assert (g_type_is_a (pad_type, GST_TYPE_AGGREGATOR_PAD));
   self->srcpad =
       g_object_new (pad_type, "name", "src", "direction", GST_PAD_SRC,
