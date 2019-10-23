@@ -12,7 +12,7 @@ glib = { version = "0.8" }
 gstreamer = { version = "0.14", features = ["subclassing"] }
 gstreamer-video = { version = "0.14", features = ["subclassing"] }
 gstreamer-check = { version = "0.14" }
-rav1e = { git = "https://github.com/xiph/rav1e.git", default-features=false }
+rav1e = { git = "https://github.com/xiph/rav1e.git", rev = "c082d381f061030c81092c3cc9c9a25a55c40498", default-features = false }
 
 [lib]
 name = "gstrav1e"

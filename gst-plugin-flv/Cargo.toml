@@ -14,7 +14,7 @@ gstreamer = { version = "0.14", features = ["subclassing"] }
 gstreamer-base = { version = "0.14" }
 num-rational = { version = "0.2", default-features = false, features = [] }
 nom = "4.0"
-flavors = {git = "https://github.com/rust-av/flavors.git"}
+flavors = {git = "https://github.com/rust-av/flavors.git", rev = "90de986d5a64df0cf35b8392b2de94c1b924301a" }
 muldiv = "0.2"
 byteorder = "1.0"
 lazy_static = "1.0"
