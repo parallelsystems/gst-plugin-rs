@@ -43,6 +43,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::get_current_running_time;
 use crate::runtime::prelude::*;
 use crate::runtime::{
     self, Context, JoinHandle, PadContext, PadSink, PadSinkRef, PadSrc, PadSrcRef, PadSrcWeak,
@@ -433,18 +434,6 @@ lazy_static! {
 }
 
 impl JitterBuffer {
-    fn get_current_running_time(&self, element: &gst::Element) -> gst::ClockTime {
-        if let Some(clock) = element.get_clock() {
-            if clock.get_time() > element.get_base_time() {
-                clock.get_time() - element.get_base_time()
-            } else {
-                gst::ClockTime(Some(0))
-            }
-        } else {
-            gst::CLOCK_TIME_NONE
-        }
-    }
-
     fn parse_caps(
         &self,
         state: &mut MutexGuard<State>,
@@ -644,7 +633,7 @@ impl JitterBuffer {
         }
 
         if dts == gst::CLOCK_TIME_NONE {
-            dts = self.get_current_running_time(element);
+            dts = get_current_running_time(element);
             pts = dts;
 
             estimated_dts = state.clock_rate != -1;
@@ -945,7 +934,7 @@ impl JitterBuffer {
             )
         };
 
-        let now = self.get_current_running_time(element);
+        let now = get_current_running_time(element);
 
         gst_debug!(
             CAT,
@@ -1016,7 +1005,7 @@ impl JitterBuffer {
                 None => return,
             };
 
-            let now = jb.get_current_running_time(&element);
+            let now = get_current_running_time(&element);
 
             gst_debug!(
                 CAT,
