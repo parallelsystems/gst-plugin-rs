@@ -19,20 +19,25 @@ use glib;
 use glib::prelude::*;
 use glib::subclass;
 use glib::subclass::prelude::*;
+use glib::{glib_object_impl, glib_object_subclass};
+
 use gst;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
+use gst::{gst_debug, gst_element_error, gst_error, gst_error_msg, gst_log, gst_trace};
 use gst_audio;
 
-use std::sync::Mutex;
+use futures::future::BoxFuture;
+use futures::lock::Mutex;
+use futures::prelude::*;
+
+use std::sync::{self, Arc};
 use std::time;
 use std::{i32, u32};
 
-use futures::future;
-use futures::sync::oneshot;
-use futures::{Future, Stream};
-
 use either::Either;
+
+use lazy_static::lazy_static;
 
 use rand;
 
@@ -40,7 +45,8 @@ use muldiv::MulDiv;
 
 use byte_slice_cast::*;
 
-use iocontext::*;
+use crate::runtime::prelude::*;
+use crate::runtime::{self, Context, JoinHandle, PadSrc, PadSrcRef};
 
 const DEFAULT_CONTEXT: &'static str = "";
 const DEFAULT_CONTEXT_WAIT: u32 = 0;
@@ -205,106 +211,31 @@ static PROPERTIES: [subclass::Property; 12] = [
     }),
 ];
 
-struct State {
-    io_context: Option<IOContext>,
-    pending_future_id: Option<PendingFutureId>,
-    cancel: Option<oneshot::Sender<()>>,
-    pending_future_cancel: Option<oneshot::Sender<()>>,
-    need_initial_events: bool,
-    buffer_pool: Option<gst::BufferPool>,
-    sample_offset: u64,
-    start_time: gst::ClockTime,
-    tone_gen: Option<(tonegen::ToneGen, tonegen::ToneGenSettings)>,
-    last_time: Option<gst::ClockTime>,
+#[derive(Debug, Default)]
+struct ToneSrcPadHandlerInner {
+    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
 }
 
-impl Default for State {
-    fn default() -> State {
-        State {
-            io_context: None,
-            pending_future_id: None,
-            cancel: None,
-            pending_future_cancel: None,
-            need_initial_events: true,
-            buffer_pool: None,
-            sample_offset: 0,
-            start_time: gst::CLOCK_TIME_NONE,
-            tone_gen: None,
-            last_time: None,
-        }
-    }
-}
+#[derive(Clone, Debug, Default)]
+struct ToneSrcPadHandler(Arc<ToneSrcPadHandlerInner>);
 
-struct ToneSrc {
-    cat: gst::DebugCategory,
-    src_pad: gst::Pad,
-    state: Mutex<State>,
-    settings: Mutex<Settings>,
-}
-
-impl ToneSrc {
-    fn create_io_context_event(state: &State) -> Option<gst::Event> {
-        if let (&Some(ref pending_future_id), &Some(ref io_context)) =
-            (&state.pending_future_id, &state.io_context)
-        {
-            let s = gst::Structure::new(
-                "ts-io-context",
-                &[
-                    ("io-context", &io_context),
-                    ("pending-future-id", &*pending_future_id),
-                ],
-            );
-            Some(gst::Event::new_custom_downstream_sticky(s).build())
-        } else {
-            None
-        }
-    }
-
-    fn src_event(&self, pad: &gst::Pad, element: &gst::Element, event: gst::Event) -> bool {
-        use gst::EventView;
-
-        gst_log!(self.cat, obj: pad, "Handling event {:?}", event);
-
-        let ret = match event.view() {
-            EventView::FlushStart(..) => {
-                let _ = self.stop(element);
-                true
-            }
-            EventView::FlushStop(..) => {
-                let (ret, state, pending) = element.get_state(0.into());
-                if ret == Ok(gst::StateChangeSuccess::Success) && state == gst::State::Playing
-                    || ret == Ok(gst::StateChangeSuccess::Async) && pending == gst::State::Playing
-                {
-                    let _ = self.start(element);
-                }
-                true
-            }
-            EventView::Reconfigure(..) => true,
-            EventView::Latency(..) => true,
-            _ => false,
-        };
-
-        if ret {
-            gst_log!(self.cat, obj: pad, "Handled event {:?}", event);
-        } else {
-            gst_log!(self.cat, obj: pad, "Didn't handle event {:?}", event);
-        }
-
-        ret
-    }
+impl PadSrcHandler for ToneSrcPadHandler {
+    type ElementImpl = ToneSrc;
 
     fn src_query(
         &self,
-        pad: &gst::Pad,
+        pad: &PadSrcRef,
+        _tonesrc: &ToneSrc,
         _element: &gst::Element,
         query: &mut gst::QueryRef,
     ) -> bool {
         use gst::QueryView;
 
-        gst_log!(self.cat, obj: pad, "Handling query {:?}", query);
+        gst_log!(CAT, obj: pad.gst_pad(), "Handling {:?}", query);
+
         let ret = match query.view_mut() {
             QueryView::Latency(ref mut q) => {
-                q.set(true, 0.into(), 0.into());
+                q.set(true, 0.into(), gst::CLOCK_TIME_NONE);
                 true
             }
             QueryView::Scheduling(ref mut q) => {
@@ -313,7 +244,7 @@ impl ToneSrc {
                 true
             }
             QueryView::Caps(ref mut q) => {
-                let caps = pad.get_pad_template_caps().unwrap();
+                let caps = pad.gst_pad().get_pad_template_caps().unwrap();
                 let result = q
                     .get_filter()
                     .map(|f| f.intersect_with_mode(&caps, gst::CapsIntersectMode::First))
@@ -326,56 +257,208 @@ impl ToneSrc {
         };
 
         if ret {
-            gst_log!(self.cat, obj: pad, "Handled query {:?}", query);
+            gst_log!(CAT, obj: pad.gst_pad(), "Handled {:?}", query);
         } else {
-            gst_log!(self.cat, obj: pad, "Didn't handle query {:?}", query);
+            gst_log!(CAT, obj: pad.gst_pad(), "Didn't handle {:?}", query);
         }
+
         ret
     }
 
-    fn timeout(
+    fn src_event(
         &self,
+        pad: &PadSrcRef,
+        _tonesrc: &ToneSrc,
         element: &gst::Element,
-    ) -> future::Either<
-        Box<dyn Future<Item = (), Error = ()> + Send + 'static>,
-        future::FutureResult<(), ()>,
-    > {
+        event: gst::Event,
+    ) -> Either<bool, BoxFuture<'static, bool>> {
+        use gst::EventView;
+
+        gst_log!(CAT, obj: pad.gst_pad(), "Handling event {:?}", event);
+
+        let ret = match event.view() {
+            EventView::FlushStart(..) => {
+                let mut flush_join_handle = self.0.flush_join_handle.lock().unwrap();
+                if flush_join_handle.is_none() {
+                    let element = element.clone();
+                    let pad_weak = pad.downgrade();
+
+                    *flush_join_handle = Some(pad.spawn(async move {
+                        let res = ToneSrc::from_instance(&element).stop(&element).await;
+                        let pad = pad_weak.upgrade().unwrap();
+                        if res.is_ok() {
+                            gst_debug!(CAT, obj: pad.gst_pad(), "FlushStart complete");
+                        } else {
+                            gst_debug!(CAT, obj: pad.gst_pad(), "FlushStart failed");
+                        }
+
+                        res
+                    }));
+                } else {
+                    gst_debug!(CAT, obj: pad.gst_pad(), "FlushStart ignored: previous Flush in progress");
+                }
+
+                true
+            }
+            EventView::FlushStop(..) => {
+                let (ret, state, pending) = element.get_state(0.into());
+                if ret == Ok(gst::StateChangeSuccess::Success) && state == gst::State::Playing
+                    || ret == Ok(gst::StateChangeSuccess::Async) && pending == gst::State::Playing
+                {
+                    let element = element.clone();
+                    let inner_weak = Arc::downgrade(&self.0);
+                    let pad_weak = pad.downgrade();
+
+                    let fut = async move {
+                        let mut ret = false;
+
+                        let pad = pad_weak.upgrade().unwrap();
+                        let inner_weak = inner_weak.upgrade().unwrap();
+                        let flush_join_handle = inner_weak.flush_join_handle.lock().unwrap().take();
+                        if let Some(flush_join_handle) = flush_join_handle {
+                            if let Ok(Ok(())) = flush_join_handle.await {
+                                ret = ToneSrc::from_instance(&element)
+                                    .start(&element)
+                                    .await
+                                    .is_ok();
+                                gst_debug!(CAT, obj: pad.gst_pad(), "FlushStop complete");
+                            } else {
+                                gst_debug!(CAT, obj: pad.gst_pad(), "FlushStop aborted: FlushStart failed");
+                            }
+                        } else {
+                            gst_debug!(CAT, obj: pad.gst_pad(), "FlushStop ignored: no Flush in progress");
+                        }
+
+                        ret
+                    }
+                    .boxed();
+
+                    return Either::Right(fut);
+                }
+                true
+            }
+            EventView::Reconfigure(..) => true,
+            EventView::Latency(..) => true,
+            _ => false,
+        };
+
+        if ret {
+            gst_log!(CAT, obj: pad.gst_pad(), "Handled event {:?}", event);
+        } else {
+            gst_log!(CAT, obj: pad.gst_pad(), "Didn't handle event {:?}", event);
+        }
+
+        Either::Left(ret)
+    }
+}
+
+impl ToneSrcPadHandler {
+    async fn start_task(&self, pad: PadSrcRef<'_>, element: &gst::Element) {
+        let element = element.clone();
+        let pad_weak = pad.downgrade();
+
+        pad.start_task(move || {
+            let element = element.clone();
+            let pad_weak = pad_weak.clone();
+
+            async move {
+                let pad = pad_weak.upgrade().expect("PadSrc no longer exists");
+
+                if ToneSrc::from_instance(&element)
+                    .timeout(&element)
+                    .await
+                    .is_err()
+                {
+                    pad.pause_task().await;
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+}
+
+struct State {
+    need_initial_events: bool,
+    buffer_pool: Option<gst::BufferPool>,
+    sample_offset: u64,
+    start_time: gst::ClockTime,
+    tone_gen: Option<(tonegen::ToneGen, tonegen::ToneGenSettings)>,
+    last_time: Option<gst::ClockTime>,
+    interval: Option<tokio::time::Interval>,
+}
+
+impl Default for State {
+    fn default() -> State {
+        State {
+            need_initial_events: true,
+            buffer_pool: None,
+            sample_offset: 0,
+            start_time: gst::CLOCK_TIME_NONE,
+            tone_gen: None,
+            last_time: None,
+            interval: None,
+        }
+    }
+}
+
+struct ToneSrc {
+    src_pad: PadSrc,
+    src_pad_handler: ToneSrcPadHandler,
+    state: Mutex<State>,
+    settings: Mutex<Settings>,
+}
+
+lazy_static! {
+    static ref CAT: gst::DebugCategory = gst::DebugCategory::new(
+        "ts-tonesrc",
+        gst::DebugColorFlags::empty(),
+        Some("Thread-sharing tone source"),
+    );
+}
+
+impl ToneSrc {
+    async fn timeout(&self, element: &gst::Element) -> Result<(), ()> {
         let mut events = Vec::new();
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
+
+        if state.interval.is_none() {
+            let settings = self.settings.lock().await;
+            let timeout = gst::SECOND
+                .mul_div_floor(settings.samples_per_buffer as u64, 8000)
+                .unwrap()
+                .unwrap();
+            state.interval = Some(tokio::time::interval(time::Duration::from_nanos(timeout)));
+        }
+
+        state.interval.as_mut().unwrap().tick().await;
+
         if state.need_initial_events {
-            gst_debug!(self.cat, obj: element, "Pushing initial events");
+            gst_debug!(CAT, obj: element, "Pushing initial events");
 
             let stream_id = format!("{:08x}{:08x}", rand::random::<u32>(), rand::random::<u32>());
             events.push(gst::Event::new_stream_start(&stream_id).build());
 
-            events
-                .push(gst::Event::new_caps(&self.src_pad.get_pad_template_caps().unwrap()).build());
+            events.push(
+                gst::Event::new_caps(&self.src_pad.gst_pad().get_pad_template_caps().unwrap())
+                    .build(),
+            );
             events.push(
                 gst::Event::new_segment(&gst::FormattedSegment::<gst::format::Time>::new()).build(),
             );
 
-            if let Some(event) = Self::create_io_context_event(&state) {
-                events.push(event);
-
-                // Get rid of reconfigure flag
-                self.src_pad.check_reconfigure();
-            }
             state.need_initial_events = false;
-        } else if self.src_pad.check_reconfigure() {
-            if let Some(event) = Self::create_io_context_event(&state) {
-                events.push(event);
-            }
         }
 
         let buffer_pool = match state.buffer_pool {
             Some(ref pool) => pool.clone(),
-            None => return future::Either::B(future::err(())),
+            None => return Err(()),
         };
 
         drop(state);
 
         for event in events {
-            self.src_pad.push_event(event);
+            self.src_pad.push_event(event).await;
         }
 
         let res = {
@@ -385,8 +468,8 @@ impl ToneSrc {
                     {
                         let buffer = buffer.get_mut().unwrap();
 
-                        let settings = self.settings.lock().unwrap().clone();
-                        let mut state = self.state.lock().unwrap();
+                        let settings = self.settings.lock().await.clone();
+                        let mut state = self.state.lock().await;
 
                         match &mut state.tone_gen {
                             &mut Some((_, ref old_settings))
@@ -431,14 +514,14 @@ impl ToneSrc {
                                 || now - last_time < expected_distance - 5 * gst::MSECOND
                             {
                                 gst_error!(
-                                    self.cat,
+                                    CAT,
                                     obj: element,
                                     "Distance between last and current output too high/low: got {}, expected {}",
                                     now - last_time, expected_distance,
                                 );
                             } else {
                                 gst_trace!(
-                                    self.cat,
+                                    CAT,
                                     obj: element,
                                     "Distance between last and current output normal: got {}, expected {}",
                                     now - last_time,
@@ -449,23 +532,23 @@ impl ToneSrc {
                         state.last_time = Some(now);
                     }
 
-                    gst_log!(self.cat, obj: element, "Forwarding buffer {:?}", buffer);
-                    self.src_pad.push(buffer).map(|_| ())
+                    gst_log!(CAT, obj: element, "Forwarding buffer {:?}", buffer);
+                    self.src_pad.push(buffer).await.map(|_| ())
                 }
             }
         };
 
-        let res = match res {
+        match res {
             Ok(_) => {
-                gst_log!(self.cat, obj: element, "Successfully pushed item");
+                gst_log!(CAT, obj: element, "Successfully pushed item");
                 Ok(())
             }
             Err(gst::FlowError::Flushing) | Err(gst::FlowError::Eos) => {
-                gst_debug!(self.cat, obj: element, "EOS");
+                gst_debug!(CAT, obj: element, "EOS");
                 Err(())
             }
             Err(err) => {
-                gst_error!(self.cat, obj: element, "Got error {}", err);
+                gst_error!(CAT, obj: element, "Got error {}", err);
                 gst_element_error!(
                     element,
                     gst::StreamError::Failed,
@@ -474,82 +557,54 @@ impl ToneSrc {
                 );
                 Err(())
             }
-        };
-
-        match res {
-            Ok(()) => {
-                let mut state = self.state.lock().unwrap();
-
-                if let State {
-                    io_context: Some(ref io_context),
-                    pending_future_id: Some(ref pending_future_id),
-                    ref mut pending_future_cancel,
-                    ..
-                } = *state
-                {
-                    let (cancel, future) = io_context.drain_pending_futures(*pending_future_id);
-                    *pending_future_cancel = cancel;
-
-                    future
-                } else {
-                    future::Either::B(future::ok(()))
-                }
-            }
-            Err(_) => future::Either::B(future::err(())),
         }
     }
 
-    fn prepare(&self, element: &gst::Element) -> Result<(), gst::ErrorMessage> {
-        gst_debug!(self.cat, obj: element, "Preparing");
+    async fn prepare(&self, element: &gst::Element) -> Result<(), gst::ErrorMessage> {
+        gst_debug!(CAT, obj: element, "Preparing");
 
-        let settings = self.settings.lock().unwrap().clone();
-
-        let mut state = self.state.lock().unwrap();
-
-        let io_context =
-            IOContext::new(&settings.context, settings.context_wait).map_err(|err| {
+        let context = {
+            let settings = self.settings.lock().await;
+            Context::acquire(&settings.context, settings.context_wait).map_err(|err| {
                 gst_error_msg!(
                     gst::ResourceError::OpenRead,
-                    ["Failed to create IO context: {}", err]
+                    ["Failed to acquire Context: {}", err]
+                )
+            })?
+        };
+
+        self.src_pad
+            .prepare(context, &ToneSrcPadHandler::default())
+            .await
+            .map_err(|err| {
+                gst_error_msg!(
+                    gst::ResourceError::OpenRead,
+                    ["Error preparing src_pads: {:?}", err]
                 )
             })?;
 
-        let pending_future_id = io_context.acquire_pending_future_id();
-        gst_debug!(
-            self.cat,
-            obj: element,
-            "Got pending future id {:?}",
-            pending_future_id
-        );
-
-        state.io_context = Some(io_context);
-        state.pending_future_id = Some(pending_future_id);
-
-        gst_debug!(self.cat, obj: element, "Prepared");
+        gst_debug!(CAT, obj: element, "Prepared");
 
         Ok(())
     }
 
-    fn unprepare(&self, element: &gst::Element) -> Result<(), ()> {
-        gst_debug!(self.cat, obj: element, "Unpreparing");
+    async fn unprepare(&self, element: &gst::Element) -> Result<(), ()> {
+        gst_debug!(CAT, obj: element, "Unpreparing");
 
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().await;
 
-        if let (&Some(ref pending_future_id), &Some(ref io_context)) =
-            (&state.pending_future_id, &state.io_context)
-        {
-            io_context.release_pending_future_id(*pending_future_id);
-        }
+        self.src_pad.stop_task().await;
+        let _ = self.src_pad.unprepare().await;
 
         *state = State::default();
 
-        gst_debug!(self.cat, obj: element, "Unprepared");
+        gst_debug!(CAT, obj: element, "Unprepared");
 
         Ok(())
     }
 
-    fn start(&self, element: &gst::Element) -> Result<(), gst::ErrorMessage> {
-        gst_debug!(self.cat, obj: element, "Starting");
+    async fn start(&self, element: &gst::Element) -> Result<(), gst::ErrorMessage> {
+        gst_debug!(CAT, obj: element, "Starting");
 
         let clock = element.get_clock();
         if clock != Some(gst::SystemClock::obtain()) {
@@ -560,18 +615,16 @@ impl ToneSrc {
         }
         let clock = clock.unwrap();
 
-        let settings = self.settings.lock().unwrap().clone();
-        let mut state = self.state.lock().unwrap();
+        let settings = self.settings.lock().await;
+        let mut state = self.state.lock().await;
 
         let State {
-            ref io_context,
-            ref mut cancel,
             ref mut buffer_pool,
             ref mut start_time,
             ..
         } = *state;
 
-        let caps = self.src_pad.get_pad_template_caps().unwrap();
+        let caps = self.src_pad.gst_pad().get_pad_template_caps().unwrap();
         let pool = gst::BufferPool::new();
         let mut config = pool.get_config();
         config.set_params(Some(&caps), 2 * settings.samples_per_buffer, 0, 0);
@@ -589,52 +642,28 @@ impl ToneSrc {
         })?;
         *buffer_pool = Some(pool);
 
-        let io_context = io_context.as_ref().unwrap();
-
-        let (sender, receiver) = oneshot::channel();
-
-        let timeout = gst::SECOND
-            .mul_div_floor(settings.samples_per_buffer as u64, 8000)
-            .unwrap()
-            .unwrap();
-        let element_clone = element.clone();
-        let future = Interval::new(&io_context, time::Duration::from_nanos(timeout))
-            .map(Either::Left)
-            .map_err(|_| ())
-            .select(receiver.map(Either::Right).map_err(|_| ()).into_stream())
-            .for_each(move |item| {
-                let tonesrc = Self::from_instance(&element_clone);
-
-                match item {
-                    Either::Left(_) => tonesrc.timeout(&element_clone),
-                    Either::Right(_) => {
-                        gst_debug!(tonesrc.cat, obj: &element_clone, "Interrupted");
-                        future::Either::B(future::err(()))
-                    }
-                }
-            });
-
-        io_context.spawn(future);
-        *cancel = Some(sender);
-
         *start_time = clock.get_time() - element.get_base_time();
 
-        gst_debug!(self.cat, obj: element, "Started");
+        self.src_pad_handler
+            .start_task(self.src_pad.as_ref(), element)
+            .await;
+
+        gst_debug!(CAT, obj: element, "Started");
 
         Ok(())
     }
 
-    fn stop(&self, element: &gst::Element) -> Result<(), ()> {
-        gst_debug!(self.cat, obj: element, "Stopping");
-        let mut state = self.state.lock().unwrap();
+    async fn stop(&self, element: &gst::Element) -> Result<(), ()> {
+        gst_debug!(CAT, obj: element, "Stopping");
+        let mut state = self.state.lock().await;
+
+        self.src_pad.pause_task().await;
 
         if let Some(pool) = state.buffer_pool.take() {
             let _ = pool.set_active(false);
         }
-        let _ = state.cancel.take();
-        let _ = state.pending_future_cancel.take();
 
-        gst_debug!(self.cat, obj: element, "Stopped");
+        gst_debug!(CAT, obj: element, "Stopped");
 
         Ok(())
     }
@@ -684,30 +713,11 @@ impl ObjectSubclass for ToneSrc {
 
     fn new_with_class(klass: &subclass::simple::ClassStruct<Self>) -> Self {
         let templ = klass.get_pad_template("src").unwrap();
-        let src_pad = gst::Pad::new_from_template(&templ, Some("src"));
-
-        src_pad.set_event_function(|pad, parent, event| {
-            ToneSrc::catch_panic_pad_function(
-                parent,
-                || false,
-                |queue, element| queue.src_event(pad, element, event),
-            )
-        });
-        src_pad.set_query_function(|pad, parent, query| {
-            ToneSrc::catch_panic_pad_function(
-                parent,
-                || false,
-                |queue, element| queue.src_query(pad, element, query),
-            )
-        });
+        let src_pad = PadSrc::new_from_template(&templ, Some("src"));
 
         Self {
-            cat: gst::DebugCategory::new(
-                "ts-tonesrc",
-                gst::DebugColorFlags::empty(),
-                Some("Thread-sharing tone source"),
-            ),
             src_pad: src_pad,
+            src_pad_handler: ToneSrcPadHandler::default(),
             state: Mutex::new(State::default()),
             settings: Mutex::new(Settings::default()),
         }
@@ -722,52 +732,52 @@ impl ObjectImpl for ToneSrc {
 
         match *prop {
             subclass::Property("context", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.context = value.get().unwrap().unwrap_or_else(|| "".into());
             }
             subclass::Property("context-wait", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.context_wait = value.get_some().unwrap();
             }
             subclass::Property("samples-per-buffer", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.samples_per_buffer = value.get_some().unwrap();
             }
             subclass::Property("freq1", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.freq1 = value.get_some().unwrap();
             }
             subclass::Property("vol1", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.vol1 = value.get_some().unwrap();
             }
 
             subclass::Property("freq2", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.freq2 = value.get_some().unwrap();
             }
             subclass::Property("vol2", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.vol2 = value.get_some().unwrap();
             }
             subclass::Property("on-time1", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.on_time1 = value.get_some().unwrap();
             }
             subclass::Property("off-time1", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.off_time1 = value.get_some().unwrap();
             }
             subclass::Property("on-time2", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.on_time2 = value.get_some().unwrap();
             }
             subclass::Property("off-time2", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.off_time2 = value.get_some().unwrap();
             }
             subclass::Property("repeat", ..) => {
-                let mut settings = self.settings.lock().unwrap();
+                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.repeat = value.get_some().unwrap();
             }
             _ => unimplemented!(),
@@ -779,51 +789,51 @@ impl ObjectImpl for ToneSrc {
 
         match *prop {
             subclass::Property("context", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.context.to_value())
             }
             subclass::Property("context-wait", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.context_wait.to_value())
             }
             subclass::Property("samples-per-buffer", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.samples_per_buffer.to_value())
             }
             subclass::Property("freq1", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.freq1.to_value())
             }
             subclass::Property("vol1", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.vol1.to_value())
             }
             subclass::Property("freq2", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.freq2.to_value())
             }
             subclass::Property("vol2", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.vol2.to_value())
             }
             subclass::Property("on-time1", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.on_time1.to_value())
             }
             subclass::Property("off-time1", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.off_time1.to_value())
             }
             subclass::Property("on-time2", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.on_time2.to_value())
             }
             subclass::Property("off-time2", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.off_time2.to_value())
             }
             subclass::Property("repeat", ..) => {
-                let settings = self.settings.lock().unwrap();
+                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.repeat.to_value())
             }
             _ => unimplemented!(),
@@ -834,9 +844,9 @@ impl ObjectImpl for ToneSrc {
         self.parent_constructed(obj);
 
         let element = obj.downcast_ref::<gst::Element>().unwrap();
-        element.add_pad(&self.src_pad).unwrap();
+        element.add_pad(self.src_pad.gst_pad()).unwrap();
 
-        ::set_element_flags(element, gst::ElementFlags::SOURCE);
+        super::set_element_flags(element, gst::ElementFlags::SOURCE);
     }
 }
 
@@ -846,24 +856,23 @@ impl ElementImpl for ToneSrc {
         element: &gst::Element,
         transition: gst::StateChange,
     ) -> Result<gst::StateChangeSuccess, gst::StateChangeError> {
-        gst_trace!(self.cat, obj: element, "Changing state {:?}", transition);
+        gst_trace!(CAT, obj: element, "Changing state {:?}", transition);
 
         match transition {
-            gst::StateChange::NullToReady => match self.prepare(element) {
-                Err(err) => {
+            gst::StateChange::NullToReady => {
+                runtime::executor::block_on(self.prepare(element)).map_err(|err| {
                     element.post_error_message(&err);
-                    return Err(gst::StateChangeError);
-                }
-                Ok(_) => (),
-            },
-            gst::StateChange::PlayingToPaused => match self.stop(element) {
-                Err(_) => return Err(gst::StateChangeError),
-                Ok(_) => (),
-            },
-            gst::StateChange::ReadyToNull => match self.unprepare(element) {
-                Err(_) => return Err(gst::StateChangeError),
-                Ok(_) => (),
-            },
+                    gst::StateChangeError
+                })?;
+            }
+            gst::StateChange::PlayingToPaused => {
+                runtime::executor::block_on(self.stop(element))
+                    .map_err(|_| gst::StateChangeError)?;
+            }
+            gst::StateChange::ReadyToNull => {
+                runtime::executor::block_on(self.unprepare(element))
+                    .map_err(|_| gst::StateChangeError)?;
+            }
             _ => (),
         }
 
@@ -873,15 +882,15 @@ impl ElementImpl for ToneSrc {
             gst::StateChange::ReadyToPaused => {
                 ret = gst::StateChangeSuccess::NoPreroll;
             }
-            gst::StateChange::PausedToPlaying => match self.start(element) {
-                Err(err) => {
-                    element.post_error_message(&err);
-                    return Err(gst::StateChangeError);
-                }
-                Ok(_) => (),
-            },
+            gst::StateChange::PausedToPlaying => {
+                runtime::executor::block_on(self.start(element))
+                    .map_err(|_| gst::StateChangeError)?;
+            }
+            gst::StateChange::PlayingToPaused => {
+                ret = gst::StateChangeSuccess::NoPreroll;
+            }
             gst::StateChange::PausedToReady => {
-                let mut state = self.state.lock().unwrap();
+                let mut state = runtime::executor::block_on(self.state.lock());
                 state.need_initial_events = true;
             }
             _ => (),
@@ -892,7 +901,12 @@ impl ElementImpl for ToneSrc {
 }
 
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    gst::Element::register(Some(plugin), "ts-tonesrc", gst::Rank::None, ToneSrc::get_type())
+    gst::Element::register(
+        Some(plugin),
+        "ts-tonesrc",
+        gst::Rank::None,
+        ToneSrc::get_type(),
+    )
 }
 
 mod tonegen {
