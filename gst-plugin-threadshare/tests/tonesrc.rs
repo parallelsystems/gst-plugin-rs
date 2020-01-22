@@ -18,19 +18,19 @@
 extern crate glib;
 use glib::prelude::*;
 
-extern crate gstreamer as gst;
-extern crate gstreamer_audio as gst_audio;
-extern crate gstreamer_check as gst_check;
+use gst;
+use gst_audio;
+use gst_check;
 
-extern crate gstthreadshare;
+use gstthreadshare;
 
 fn init() {
-    use std::sync::{Once, ONCE_INIT};
-    static INIT: Once = ONCE_INIT;
+    use std::sync::Once;
+    static INIT: Once = Once::new();
 
     INIT.call_once(|| {
         gst::init().unwrap();
-        gstthreadshare::plugin_register_static();
+        gstthreadshare::plugin_register_static().expect("gstthreadshare tonesrc test");
     });
 }
 
@@ -69,21 +69,24 @@ fn test_push() {
 
         let event = h.pull_event().unwrap();
         match event.view() {
-            EventView::StreamStart(..) => {
+            EventView::CustomDownstream(..) => {
                 assert_eq!(n_events, 0);
             }
-            EventView::Caps(ev) => {
+            EventView::StreamStart(..) => {
                 assert_eq!(n_events, 1);
+            }
+            EventView::Caps(ev) => {
+                assert_eq!(n_events, 2);
                 let event_caps = ev.get_caps();
                 assert_eq!(caps.as_ref(), event_caps);
             }
             EventView::Segment(..) => {
-                assert_eq!(n_events, 2);
+                assert_eq!(n_events, 3);
                 break;
             }
             _ => (),
         }
         n_events += 1;
     }
-    assert!(n_events >= 2);
+    assert!(n_events >= 3);
 }
