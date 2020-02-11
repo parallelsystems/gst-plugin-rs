@@ -1275,12 +1275,12 @@ impl ObjectImpl for JitterBuffer {
         match *prop {
             subclass::Property("latency", ..) => {
                 let latency_ms = {
-                    let mut settings = runtime::executor::block_on(self.settings.lock());
+                    let mut settings = futures::executor::block_on(self.settings.lock());
                     settings.latency_ms = value.get_some().expect("type checked upstream");
                     settings.latency_ms as u64
                 };
 
-                runtime::executor::block_on(self.state.lock())
+                futures::executor::block_on(self.state.lock())
                     .jbuf
                     .borrow()
                     .set_delay(latency_ms * gst::MSECOND);
@@ -1288,26 +1288,26 @@ impl ObjectImpl for JitterBuffer {
                 /* TODO: post message */
             }
             subclass::Property("do-lost", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
+                let mut settings = futures::executor::block_on(self.settings.lock());
                 settings.do_lost = value.get_some().expect("type checked upstream");
             }
             subclass::Property("max-dropout-time", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
+                let mut settings = futures::executor::block_on(self.settings.lock());
                 settings.max_dropout_time = value.get_some().expect("type checked upstream");
             }
             subclass::Property("max-misorder-time", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
+                let mut settings = futures::executor::block_on(self.settings.lock());
                 settings.max_misorder_time = value.get_some().expect("type checked upstream");
             }
             subclass::Property("context", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
+                let mut settings = futures::executor::block_on(self.settings.lock());
                 settings.context = value
                     .get()
                     .expect("type checked upstream")
                     .unwrap_or_else(|| "".into());
             }
             subclass::Property("context-wait", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
+                let mut settings = futures::executor::block_on(self.settings.lock());
                 settings.context_wait = value.get_some().expect("type checked upstream");
             }
             _ => unimplemented!(),
@@ -1319,23 +1319,23 @@ impl ObjectImpl for JitterBuffer {
 
         match *prop {
             subclass::Property("latency", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
+                let settings = futures::executor::block_on(self.settings.lock());
                 Ok(settings.latency_ms.to_value())
             }
             subclass::Property("do-lost", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
+                let settings = futures::executor::block_on(self.settings.lock());
                 Ok(settings.do_lost.to_value())
             }
             subclass::Property("max-dropout-time", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
+                let settings = futures::executor::block_on(self.settings.lock());
                 Ok(settings.max_dropout_time.to_value())
             }
             subclass::Property("max-misorder-time", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
+                let settings = futures::executor::block_on(self.settings.lock());
                 Ok(settings.max_misorder_time.to_value())
             }
             subclass::Property("stats", ..) => {
-                let state = runtime::executor::block_on(self.state.lock());
+                let state = futures::executor::block_on(self.state.lock());
                 let s = gst::Structure::new(
                     "application/x-rtp-jitterbuffer-stats",
                     &[
@@ -1347,11 +1347,11 @@ impl ObjectImpl for JitterBuffer {
                 Ok(s.to_value())
             }
             subclass::Property("context", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
+                let settings = futures::executor::block_on(self.settings.lock());
                 Ok(settings.context.to_value())
             }
             subclass::Property("context-wait", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
+                let settings = futures::executor::block_on(self.settings.lock());
                 Ok(settings.context_wait.to_value())
             }
             _ => unimplemented!(),
