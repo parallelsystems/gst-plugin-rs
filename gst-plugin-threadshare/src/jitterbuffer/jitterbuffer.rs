@@ -327,20 +327,21 @@ impl PadSrcHandler for JitterBufferPadSrcHandler {
 }
 
 #[derive(Eq)]
-struct GapPacket(gst::Buffer);
+struct GapPacket(gst::Buffer, u16);
+
+impl GapPacket {
+    fn new(buffer: gst::Buffer) -> Self {
+        let mut rtp_buffer = RTPBuffer::from_buffer_readable(&buffer).unwrap();
+        let seq = rtp_buffer.get_seq();
+        drop(rtp_buffer);
+
+        Self(buffer, seq)
+    }
+}
 
 impl Ord for GapPacket {
     fn cmp(&self, other: &Self) -> Ordering {
-        let mut rtp_buffer = RTPBuffer::from_buffer_readable(&self.0).unwrap();
-        let mut other_rtp_buffer = RTPBuffer::from_buffer_readable(&other.0).unwrap();
-
-        let seq = rtp_buffer.get_seq();
-        let other_seq = other_rtp_buffer.get_seq();
-
-        drop(rtp_buffer);
-        drop(other_rtp_buffer);
-
-        0.cmp(&gst_rtp::compare_seqnum(seq, other_seq))
+        0.cmp(&gst_rtp::compare_seqnum(self.1, other.1))
     }
 }
 
@@ -521,7 +522,7 @@ impl JitterBuffer {
             gap_packets_length
         );
 
-        gap_packets.insert(GapPacket(buffer));
+        gap_packets.insert(GapPacket::new(buffer));
 
         if gap_packets_length > 0 {
             let mut prev_gap_seq = std::u32::MAX;
