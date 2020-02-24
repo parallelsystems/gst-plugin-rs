@@ -29,18 +29,18 @@ pub use tokio;
 #[macro_use]
 pub mod runtime;
 
-pub mod socket;
-mod tcpclientsrc;
-mod udpsink;
-mod udpsrc;
-
-mod appsrc;
-pub mod dataqueue;
-mod inputselector;
-mod jitterbuffer;
-mod proxy;
-mod queue;
-mod tonesrc;
+//pub mod socket;
+//mod tcpclientsrc;
+//mod udpsink;
+//mod udpsrc;
+//
+//mod appsrc;
+//pub mod dataqueue;
+//mod inputselector;
+//mod jitterbuffer;
+//mod proxy;
+//mod queue;
+//mod tonesrc;
 
 use glib::translate::*;
 use glib_sys as glib_ffi;
@@ -51,15 +51,15 @@ use gst::prelude::*;
 use gstreamer_sys as gst_ffi;
 
 fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
-    udpsrc::register(plugin)?;
-    udpsink::register(plugin)?;
-    tcpclientsrc::register(plugin)?;
-    queue::register(plugin)?;
-    proxy::register(plugin)?;
-    appsrc::register(plugin)?;
-    jitterbuffer::jitterbuffer::register(plugin)?;
-    inputselector::register(plugin)?;
-    tonesrc::register(plugin)?;
+    //udpsrc::register(plugin)?;
+    //udpsink::register(plugin)?;
+    //tcpclientsrc::register(plugin)?;
+    //queue::register(plugin)?;
+    //proxy::register(plugin)?;
+    //appsrc::register(plugin)?;
+    //jitterbuffer::jitterbuffer::register(plugin)?;
+    //inputselector::register(plugin)?;
+    //tonesrc::register(plugin)?;
 
     Ok(())
 }

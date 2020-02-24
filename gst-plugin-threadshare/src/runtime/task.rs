@@ -18,14 +18,13 @@
 //! An execution loop to run asynchronous processing.
 
 use futures::future::{self, abortable, AbortHandle, Aborted, BoxFuture};
-use futures::lock::Mutex;
 use futures::prelude::*;
 
 use gst::TaskState;
 use gst::{gst_debug, gst_log, gst_trace, gst_warning};
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{self, Arc};
 
 use super::{Context, JoinHandle, RUNTIME_CAT};
 
@@ -77,17 +76,17 @@ impl Drop for TaskInner {
 ///
 /// [`Context`]: ../executor/struct.Context.html
 #[derive(Debug)]
-pub struct Task(Arc<Mutex<TaskInner>>);
+pub struct Task(Arc<sync::Mutex<TaskInner>>);
 
 impl Default for Task {
     fn default() -> Self {
-        Task(Arc::new(Mutex::new(TaskInner::default())))
+        Task(Arc::new(sync::Mutex::new(TaskInner::default())))
     }
 }
 
 impl Task {
-    pub async fn prepare(&self, context: Context) -> Result<(), TaskError> {
-        let mut inner = self.0.lock().await;
+    pub fn prepare(&self, context: Context) -> Result<(), TaskError> {
+        let mut inner = self.0.lock().unwrap();
         if inner.state != TaskState::Stopped {
             return Err(TaskError::ActiveTask);
         }
@@ -96,8 +95,8 @@ impl Task {
         Ok(())
     }
 
-    pub async fn unprepare(&self) -> Result<(), TaskError> {
-        let mut inner = self.0.lock().await;
+    pub fn unprepare(&self) -> Result<(), TaskError> {
+        let mut inner = self.0.lock().unwrap();
         if inner.state != TaskState::Stopped {
             return Err(TaskError::ActiveTask);
         }
@@ -106,21 +105,21 @@ impl Task {
         Ok(())
     }
 
-    pub async fn state(&self) -> TaskState {
-        self.0.lock().await.state
+    pub fn state(&self) -> TaskState {
+        self.0.lock().unwrap().state
     }
 
     /// `Starts` the `Task`.
     ///
     /// The `Task` will loop on the provided @func.
     /// The execution occurs on the `Task`'s context.
-    pub async fn start<F, Fut>(&self, mut func: F)
+    pub fn start<F, Fut>(&self, mut func: F)
     where
         F: (FnMut() -> Fut) + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let inner_clone = Arc::clone(&self.0);
-        let mut inner = self.0.lock().await;
+        let mut inner = self.0.lock().unwrap();
         match inner.state {
             TaskState::Started => {
                 gst_log!(RUNTIME_CAT, "Task already Started");
@@ -136,7 +135,7 @@ impl Task {
             loop {
                 func().await;
 
-                match inner_clone.lock().await.state {
+                match inner_clone.lock().unwrap().state {
                     TaskState::Started => (),
                     TaskState::Paused | TaskState::Stopped => {
                         break;
@@ -160,8 +159,8 @@ impl Task {
     }
 
     /// Pauses the `Started` `Task`.
-    pub async fn pause(&self) -> BoxFuture<'static, ()> {
-        let mut inner = self.0.lock().await;
+    pub fn pause(&self) -> BoxFuture<'static, ()> {
+        let mut inner = self.0.lock().unwrap();
         match inner.state {
             TaskState::Started => {
                 gst_log!(RUNTIME_CAT, "Pausing Task");
@@ -189,8 +188,8 @@ impl Task {
         }
     }
 
-    pub async fn stop(&self) {
-        let mut inner = self.0.lock().await;
+    pub fn stop(&self) {
+        let mut inner = self.0.lock().unwrap();
         if inner.state == TaskState::Stopped {
             gst_log!(RUNTIME_CAT, "Task already stopped");
             return;

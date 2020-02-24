@@ -59,6 +59,10 @@
 //! `Element A` & `Element B` can also be linked to non-threadshare `Element`s in which case, they
 //! operate in a regular synchronous way.
 //!
+//! Note that only operations on the streaming thread (serialized events, buffers, serialized
+//! queries) are handled from the `PadContext` and asynchronously, everything else operates
+//! blocking.
+//!
 //! [`PadSink`]: struct.PadSink.html
 //! [`PadSrc`]: struct.PadSrc.html
 //! [`Context`]: ../executor/struct.Context.html
@@ -67,7 +71,6 @@ use either::Either;
 
 use futures::future;
 use futures::future::BoxFuture;
-use futures::lock::{Mutex, MutexGuard};
 use futures::prelude::*;
 
 use gst;
@@ -248,7 +251,7 @@ pub struct PadSrcState {
 
 #[derive(Debug)]
 struct PadSrcInner {
-    state: Mutex<PadSrcState>,
+    state: sync::Mutex<PadSrcState>,
     gst_pad: gst::Pad,
     pad_context: sync::RwLock<Option<PadContext>>,
     task: Task,
@@ -261,7 +264,7 @@ impl PadSrcInner {
         }
 
         PadSrcInner {
-            state: Mutex::new(PadSrcState::default()),
+            state: sync::Mutex::new(PadSrcState::default()),
             gst_pad,
             pad_context: sync::RwLock::new(None),
             task: Task::default(),
@@ -330,10 +333,6 @@ impl<'a> PadSrcRef<'a> {
         self.strong.gst_pad()
     }
 
-    pub async fn lock_state(&'a self) -> MutexGuard<'a, PadSrcState> {
-        self.strong.lock_state().await
-    }
-
     pub fn pad_context(&self) -> PadContextWeak {
         self.strong.pad_context()
     }
@@ -373,21 +372,22 @@ impl<'a> PadSrcRef<'a> {
     ///
     /// The `Task` will loop on the provided `func`.
     /// The execution occurs on the `Task`'s context.
-    pub async fn start_task<F, Fut>(&self, func: F)
+    pub fn start_task<F, Fut>(&self, func: F)
     where
         F: (FnMut() -> Fut) + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.strong.start_task(func).await;
+        self.strong.start_task(func);
     }
 
     /// Pauses the `Started` `Pad` `Task`.
-    pub async fn pause_task(&self) {
-        let _ = self.strong.pause_task().await;
+    pub fn pause_task(&self) {
+        self.strong.pause_task();
     }
 
-    pub async fn stop_task(&self) {
-        self.strong.stop_task().await;
+    /// Stops the `Started` `Pad` `Task`.
+    pub fn stop_task(&self) {
+        self.strong.stop_task();
     }
 
     fn activate_mode_hook(
@@ -408,9 +408,7 @@ impl<'a> PadSrcRef<'a> {
         }
 
         if !active {
-            executor::block_on(async {
-                self.strong.lock_state().await.is_initialized = false;
-            });
+            self.strong.state.lock().unwrap().is_initialized = false;
         }
 
         Ok(())
@@ -431,11 +429,6 @@ impl PadSrcStrong {
     }
 
     #[inline]
-    async fn lock_state(&self) -> MutexGuard<'_, PadSrcState> {
-        self.0.state.lock().await
-    }
-
-    #[inline]
     fn pad_context_priv(&self) -> sync::RwLockReadGuard<'_, Option<PadContext>> {
         self.0.pad_context.read().unwrap()
     }
@@ -449,7 +442,7 @@ impl PadSrcStrong {
     }
 
     #[inline]
-    pub fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
+    fn spawn<Fut>(&self, future: Fut) -> JoinHandle<Fut::Output>
     where
         Fut: Future + Send + 'static,
         Fut::Output: Send + 'static,
@@ -468,13 +461,15 @@ impl PadSrcStrong {
 
     fn push_prelude(
         &self,
-        state: &mut MutexGuard<'_, PadSrcState>,
     ) -> Result<FlowSuccess, FlowError> {
+        let state = self.state.lock().unwrap();
         if !state.is_initialized || self.gst_pad().check_reconfigure() {
+            drop(state);
             if !self.push_pad_context_event() {
                 return Err(FlowError::Error);
             }
 
+            let mut state = self.state.lock().unwrap();
             if !state.is_initialized {
                 // Get rid of reconfigure flag
                 self.gst_pad().check_reconfigure();
@@ -516,10 +511,9 @@ impl PadSrcStrong {
 
     #[inline]
     async fn push(&self, buffer: gst::Buffer) -> Result<FlowSuccess, FlowError> {
-        let mut state = self.lock_state().await;
         gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Pushing {:?}", buffer);
 
-        self.push_prelude(&mut state)?;
+        self.push_prelude()?;
 
         let success = self.gst_pad().push(buffer).map_err(|err| {
             gst_error!(RUNTIME_CAT,
@@ -540,10 +534,9 @@ impl PadSrcStrong {
 
     #[inline]
     async fn push_list(&self, list: gst::BufferList) -> Result<FlowSuccess, FlowError> {
-        let mut state = self.lock_state().await;
         gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Pushing {:?}", list);
 
-        self.push_prelude(&mut state)?;
+        self.push_prelude()?;
 
         let success = self.gst_pad().push_list(list).map_err(|err| {
             gst_error!(
@@ -566,8 +559,6 @@ impl PadSrcStrong {
 
     #[inline]
     async fn push_event(&self, event: gst::Event) -> bool {
-        let mut state = self.lock_state().await;
-
         let was_handled = if PadContext::is_pad_context_event(&event) {
             // Push our own PadContext
             if !self.push_pad_context_event() {
@@ -576,13 +567,13 @@ impl PadSrcStrong {
 
             // Get rid of reconfigure flag
             self.gst_pad().check_reconfigure();
-            state.is_initialized = true;
+            self.0.state.lock().unwrap().is_initialized = true;
 
             true
         } else {
             gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Pushing {:?}", event);
 
-            if self.push_prelude(&mut state).is_err() {
+            if self.push_prelude().is_err() {
                 return false;
             }
             self.gst_pad().push_event(event)
@@ -599,22 +590,22 @@ impl PadSrcStrong {
     }
 
     #[inline]
-    async fn start_task<F, Fut>(&self, func: F)
+    fn start_task<F, Fut>(&self, func: F)
     where
         F: (FnMut() -> Fut) + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.0.task.start(func).await;
+        self.0.task.start(func);
     }
 
     #[inline]
-    pub async fn pause_task(&self) -> BoxFuture<'static, ()> {
-        self.0.task.pause().await
+    fn pause_task(&self) {
+        self.0.task.pause();
     }
 
     #[inline]
     async fn stop_task(&self) {
-        self.0.task.stop().await;
+        self.0.task.stop();
     }
 }
 
@@ -668,10 +659,6 @@ impl PadSrc {
 
     pub fn check_reconfigure(&self) -> bool {
         self.gst_pad().check_reconfigure()
-    }
-
-    pub async fn lock_state(&self) -> MutexGuard<'_, PadSrcState> {
-        self.0.lock_state().await
     }
 
     pub fn pad_context(&self) -> PadContextWeak {
@@ -784,12 +771,12 @@ impl PadSrc {
             });
     }
 
-    pub async fn prepare<H: PadSrcHandler>(
+    pub fn prepare<H: PadSrcHandler>(
         &self,
         context: Context,
         handler: &H,
     ) -> Result<(), PadContextError> {
-        let _state = self.lock_state().await;
+        let _state = self.state.lock().unwrap();
         gst_log!(RUNTIME_CAT, obj: self.gst_pad(), "Preparing");
 
         if (self.0).0.has_pad_context() {
@@ -800,7 +787,6 @@ impl PadSrc {
             .0
             .task
             .prepare(context.clone())
-            .await
             .map_err(|_| PadContextError::ActiveTask)?;
 
         *(self.0).0.pad_context.write().unwrap() = Some(PadContext::new(context.clone()));
