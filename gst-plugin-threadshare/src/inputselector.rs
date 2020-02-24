@@ -38,6 +38,7 @@ use lazy_static::lazy_static;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use std::u32;
 
@@ -349,8 +350,8 @@ impl Default for Pads {
 struct InputSelector {
     src_pad: PadSrc,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
-    pads: Mutex<Pads>,
+    settings: StdMutex<Settings>,
+    pads: StdMutex<Pads>,
 }
 
 lazy_static! {
@@ -365,15 +366,15 @@ impl InputSelector {
     async fn prepare(&self, element: &gst::Element) -> Result<(), gst::ErrorMessage> {
         gst_debug!(CAT, obj: element, "Preparing");
 
-        let settings = self.settings.lock().await;
-
-        let context =
+        let context = {
+            let settings = self.settings.lock().unwrap();
             Context::acquire(&settings.context, settings.context_wait).map_err(|err| {
                 gst_error_msg!(
                     gst::ResourceError::OpenRead,
                     ["Failed to acquire Context: {}", err]
                 )
-            })?;
+            })?
+        };
 
         self.src_pad
             .prepare(context, &InputSelectorPadSrcHandler {})
@@ -464,8 +465,8 @@ impl ObjectSubclass for InputSelector {
         Self {
             src_pad,
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
-            pads: Mutex::new(Pads::default()),
+            settings: StdMutex::new(Settings::default()),
+            pads: StdMutex::new(Pads::default()),
         }
     }
 }
@@ -478,14 +479,14 @@ impl ObjectImpl for InputSelector {
 
         match *prop {
             subclass::Property("context", ..) => {
-                let mut settings = block_on(self.settings.lock());
+                let mut settings = self.settings.lock().unwrap();
                 settings.context = value
                     .get()
                     .expect("type checked upstream")
                     .unwrap_or_else(|| "".into());
             }
             subclass::Property("context-wait", ..) => {
-                let mut settings = block_on(self.settings.lock());
+                let mut settings = self.settings.lock().unwrap();
                 settings.context_wait = value.get_some().expect("type checked upstream");
             }
             subclass::Property("active-pad", ..) => {
@@ -502,11 +503,11 @@ impl ObjectImpl for InputSelector {
 
         match *prop {
             subclass::Property("context", ..) => {
-                let settings = block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.context.to_value())
             }
             subclass::Property("context-wait", ..) => {
-                let settings = block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.context_wait.to_value())
             }
             subclass::Property("active-pad", ..) => {
@@ -566,32 +567,35 @@ impl ElementImpl for InputSelector {
         _name: Option<String>,
         _caps: Option<&gst::Caps>,
     ) -> Option<gst::Pad> {
-        let mut state = block_on(self.state.lock());
-        let mut pads = block_on(self.pads.lock());
+        let mut pads = self.pads.lock().unwrap();
         let sink_pad =
             gst::Pad::new_from_template(&templ, Some(format!("sink_{}", pads.pad_serial).as_str()));
-        pads.pad_serial += 1;
-        sink_pad.set_active(true).unwrap();
-        element.add_pad(&sink_pad).unwrap();
         let sink_pad = PadSink::new(sink_pad);
-        let ret = sink_pad.gst_pad().clone();
-
+        let gst_pad = sink_pad.gst_pad().clone();
+        pads.pad_serial += 1;
         block_on(sink_pad.prepare(&InputSelectorPadSinkHandler::new()));
-        pads.sink_pads.insert(ret.clone(), sink_pad);
+        pads.sink_pads.insert(gst_pad.clone(), sink_pad);
+        drop(pads);
 
+        gst_pad.set_active(true).unwrap();
+        element.add_pad(&gst_pad).unwrap();
+
+        let mut state = block_on(self.state.lock());
         if state.active_sinkpad.is_none() {
-            state.active_sinkpad = Some(ret.clone());
+            state.active_sinkpad = Some(gst_pad.clone());
             state.send_sticky = true;
         }
 
-        Some(ret)
+        Some(gst_pad)
     }
 
     fn release_pad(&self, element: &gst::Element, pad: &gst::Pad) {
-        let mut pads = block_on(self.pads.lock());
-        let sink_pad = pads.sink_pads.remove(pad).unwrap();
-        block_on(sink_pad.unprepare());
-        element.remove_pad(pad).unwrap();
+        let mut pads = self.pads.lock().unwrap();
+        if let Some(sink_pad) = pads.sink_pads.remove(pad) {
+            drop(pads);
+            block_on(sink_pad.unprepare());
+            element.remove_pad(pad).unwrap();
+        }
     }
 }
 

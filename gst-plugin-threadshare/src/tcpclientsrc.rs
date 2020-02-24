@@ -39,6 +39,7 @@ use rand;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{self, Arc};
+use std::sync::Mutex as StdMutex;
 use std::u16;
 
 use tokio::io::AsyncReadExt;
@@ -195,7 +196,7 @@ impl Default for TcpClientSrcPadHandlerState {
 struct TcpClientSrcPadHandlerInner {
     state: sync::RwLock<TcpClientSrcPadHandlerState>,
     socket_stream: Mutex<Option<SocketStream<TcpClientReader>>>,
-    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
+    flush_join_handle: StdMutex<Option<JoinHandle<Result<(), ()>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -480,7 +481,7 @@ struct TcpClientSrc {
     src_pad: PadSrc,
     src_pad_handler: TcpClientSrcPadHandler,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
+    settings: StdMutex<Settings>,
     preparation_set: Mutex<Option<PreparationSet>>,
 }
 
@@ -498,7 +499,7 @@ impl TcpClientSrc {
         gst_debug!(CAT, obj: element, "Preparing");
 
         let context = {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
 
             self.src_pad_handler.0.state.write().unwrap().caps = settings.caps.clone();
 
@@ -524,7 +525,7 @@ impl TcpClientSrc {
     async fn prepare_socket(element: gst::Element) -> Result<(), gst::ErrorMessage> {
         let this = Self::from_instance(&element);
 
-        let settings = this.settings.lock().await.clone();
+        let settings = this.settings.lock().unwrap().clone();
         gst_debug!(CAT, obj: &element, "Preparing Socket");
 
         let addr: IpAddr = match settings.address {
@@ -721,7 +722,7 @@ impl ObjectSubclass for TcpClientSrc {
             src_pad,
             src_pad_handler: TcpClientSrcPadHandler::default(),
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
+            settings: StdMutex::new(Settings::default()),
             preparation_set: Mutex::new(None),
         }
     }
@@ -733,7 +734,7 @@ impl ObjectImpl for TcpClientSrc {
     fn set_property(&self, _obj: &glib::Object, id: usize, value: &glib::Value) {
         let prop = &PROPERTIES[id];
 
-        let mut settings = runtime::executor::block_on(self.settings.lock());
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("address", ..) => {
                 settings.address = value.get().expect("type checked upstream");
@@ -763,7 +764,7 @@ impl ObjectImpl for TcpClientSrc {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES[id];
 
-        let settings = runtime::executor::block_on(self.settings.lock());
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("address", ..) => Ok(settings.address.to_value()),
             subclass::Property("port", ..) => Ok(settings.port.to_value()),

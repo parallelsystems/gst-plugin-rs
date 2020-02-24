@@ -36,7 +36,8 @@ use gst::{gst_debug, gst_element_error, gst_error, gst_error_msg, gst_log, gst_t
 use lazy_static::lazy_static;
 
 use std::collections::VecDeque;
-use std::sync::{self, Arc};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::{u32, u64};
 
 use crate::runtime::prelude::*;
@@ -142,7 +143,7 @@ impl PendingQueue {
 
 #[derive(Debug, Default)]
 struct QueuePadSinkHandlerInner {
-    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
+    flush_join_handle: StdMutex<Option<JoinHandle<Result<(), ()>>>>,
 }
 
 #[derive(Clone, Default)]
@@ -279,7 +280,7 @@ impl PadSinkHandler for QueuePadSinkHandler {
 
 #[derive(Debug, Default)]
 struct QueuePadSrcHandlerInner {
-    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
+    flush_join_handle: StdMutex<Option<JoinHandle<Result<(), ()>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -517,7 +518,7 @@ struct Queue {
     sink_pad: PadSink,
     src_pad: PadSrc,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
+    settings: StdMutex<Settings>,
 }
 
 lazy_static! {
@@ -703,7 +704,7 @@ impl Queue {
         let mut state = self.state.lock().await;
         gst_debug!(CAT, obj: element, "Preparing");
 
-        let settings = self.settings.lock().await;
+        let settings = self.settings.lock().unwrap().clone();
 
         {
             let dataqueue = DataQueue::new(
@@ -866,7 +867,7 @@ impl ObjectSubclass for Queue {
             sink_pad,
             src_pad,
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
+            settings: StdMutex::new(Settings::default()),
         }
     }
 }
@@ -877,7 +878,7 @@ impl ObjectImpl for Queue {
     fn set_property(&self, _obj: &glib::Object, id: usize, value: &glib::Value) {
         let prop = &PROPERTIES[id];
 
-        let mut settings = runtime::executor::block_on(self.settings.lock());
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("max-size-buffers", ..) => {
                 settings.max_size_buffers = value.get_some().expect("type checked upstream");
@@ -904,7 +905,7 @@ impl ObjectImpl for Queue {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES[id];
 
-        let settings = runtime::executor::block_on(self.settings.lock());
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("max-size-buffers", ..) => Ok(settings.max_size_buffers.to_value()),
             subclass::Property("max-size-bytes", ..) => Ok(settings.max_size_bytes.to_value()),

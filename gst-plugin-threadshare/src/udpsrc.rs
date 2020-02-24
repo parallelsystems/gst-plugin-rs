@@ -42,6 +42,7 @@ use rand;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{self, Arc};
+use std::sync::Mutex as StdMutex;
 use std::u16;
 
 use crate::runtime::prelude::*;
@@ -248,7 +249,7 @@ impl Default for UdpSrcPadHandlerState {
 struct UdpSrcPadHandlerInner {
     state: sync::RwLock<UdpSrcPadHandlerState>,
     socket_stream: Mutex<Option<SocketStream<UdpReader>>>,
-    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
+    flush_join_handle: StdMutex<Option<JoinHandle<Result<(), ()>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -542,7 +543,7 @@ struct UdpSrc {
     src_pad: PadSrc,
     src_pad_handler: UdpSrcPadHandler,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
+    settings: StdMutex<Settings>,
 }
 
 lazy_static! {
@@ -556,7 +557,7 @@ lazy_static! {
 impl UdpSrc {
     async fn prepare(&self, element: &gst::Element) -> Result<(), gst::ErrorMessage> {
         let mut state = self.state.lock().await;
-        let mut settings = self.settings.lock().await.clone();
+        let mut settings = self.settings.lock().unwrap().clone();
 
         gst_debug!(CAT, obj: element, "Preparing");
 
@@ -766,7 +767,7 @@ impl UdpSrc {
         let mut state = self.state.lock().await;
         gst_debug!(CAT, obj: element, "Unpreparing");
 
-        self.settings.lock().await.used_socket = None;
+        self.settings.lock().unwrap().used_socket = None;
 
         self.src_pad.stop_task().await;
 
@@ -881,7 +882,7 @@ impl ObjectSubclass for UdpSrc {
             src_pad,
             src_pad_handler: UdpSrcPadHandler::default(),
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
+            settings: StdMutex::new(Settings::default()),
         }
     }
 }
@@ -892,7 +893,7 @@ impl ObjectImpl for UdpSrc {
     fn set_property(&self, _obj: &glib::Object, id: usize, value: &glib::Value) {
         let prop = &PROPERTIES[id];
 
-        let mut settings = runtime::executor::block_on(self.settings.lock());
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("address", ..) => {
                 settings.address = value.get().expect("type checked upstream");
@@ -937,7 +938,7 @@ impl ObjectImpl for UdpSrc {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES[id];
 
-        let settings = runtime::executor::block_on(self.settings.lock());
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("address", ..) => Ok(settings.address.to_value()),
             subclass::Property("port", ..) => Ok(settings.port.to_value()),

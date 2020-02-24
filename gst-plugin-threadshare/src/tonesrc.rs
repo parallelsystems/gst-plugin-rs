@@ -31,7 +31,8 @@ use futures::future::BoxFuture;
 use futures::lock::Mutex;
 use futures::prelude::*;
 
-use std::sync::{self, Arc};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time;
 use std::{i32, u32};
 
@@ -213,7 +214,7 @@ static PROPERTIES: [subclass::Property; 12] = [
 
 #[derive(Debug, Default)]
 struct ToneSrcPadHandlerInner {
-    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
+    flush_join_handle: StdMutex<Option<JoinHandle<Result<(), ()>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -406,7 +407,7 @@ struct ToneSrc {
     src_pad: PadSrc,
     src_pad_handler: ToneSrcPadHandler,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
+    settings: StdMutex<Settings>,
 }
 
 lazy_static! {
@@ -423,7 +424,7 @@ impl ToneSrc {
         let mut state = self.state.lock().await;
 
         if state.interval.is_none() {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             let timeout = gst::SECOND
                 .mul_div_floor(settings.samples_per_buffer as u64, 8000)
                 .unwrap()
@@ -468,7 +469,7 @@ impl ToneSrc {
                     {
                         let buffer = buffer.get_mut().unwrap();
 
-                        let settings = self.settings.lock().await.clone();
+                        let settings = self.settings.lock().unwrap().clone();
                         let mut state = self.state.lock().await;
 
                         match &mut state.tone_gen {
@@ -564,7 +565,7 @@ impl ToneSrc {
         gst_debug!(CAT, obj: element, "Preparing");
 
         let context = {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             Context::acquire(&settings.context, settings.context_wait).map_err(|err| {
                 gst_error_msg!(
                     gst::ResourceError::OpenRead,
@@ -615,7 +616,7 @@ impl ToneSrc {
         }
         let clock = clock.unwrap();
 
-        let settings = self.settings.lock().await;
+        let samples_per_buffer = self.settings.lock().unwrap().samples_per_buffer;
         let mut state = self.state.lock().await;
 
         let State {
@@ -627,7 +628,7 @@ impl ToneSrc {
         let caps = self.src_pad.gst_pad().get_pad_template_caps().unwrap();
         let pool = gst::BufferPool::new();
         let mut config = pool.get_config();
-        config.set_params(Some(&caps), 2 * settings.samples_per_buffer, 0, 0);
+        config.set_params(Some(&caps), 2 * samples_per_buffer, 0, 0);
         pool.set_config(config).map_err(|_| {
             gst_error_msg!(
                 gst::ResourceError::Settings,
@@ -719,7 +720,7 @@ impl ObjectSubclass for ToneSrc {
             src_pad: src_pad,
             src_pad_handler: ToneSrcPadHandler::default(),
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
+            settings: StdMutex::new(Settings::default()),
         }
     }
 }
@@ -730,54 +731,43 @@ impl ObjectImpl for ToneSrc {
     fn set_property(&self, _obj: &glib::Object, id: usize, value: &glib::Value) {
         let prop = &PROPERTIES[id];
 
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("context", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.context = value.get().unwrap().unwrap_or_else(|| "".into());
             }
             subclass::Property("context-wait", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.context_wait = value.get_some().unwrap();
             }
             subclass::Property("samples-per-buffer", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.samples_per_buffer = value.get_some().unwrap();
             }
             subclass::Property("freq1", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.freq1 = value.get_some().unwrap();
             }
             subclass::Property("vol1", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.vol1 = value.get_some().unwrap();
             }
 
             subclass::Property("freq2", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.freq2 = value.get_some().unwrap();
             }
             subclass::Property("vol2", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.vol2 = value.get_some().unwrap();
             }
             subclass::Property("on-time1", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.on_time1 = value.get_some().unwrap();
             }
             subclass::Property("off-time1", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.off_time1 = value.get_some().unwrap();
             }
             subclass::Property("on-time2", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.on_time2 = value.get_some().unwrap();
             }
             subclass::Property("off-time2", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.off_time2 = value.get_some().unwrap();
             }
             subclass::Property("repeat", ..) => {
-                let mut settings = runtime::executor::block_on(self.settings.lock());
                 settings.tone_gen_settings.repeat = value.get_some().unwrap();
             }
             _ => unimplemented!(),
@@ -787,53 +777,42 @@ impl ObjectImpl for ToneSrc {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES[id];
 
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("context", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.context.to_value())
             }
             subclass::Property("context-wait", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.context_wait.to_value())
             }
             subclass::Property("samples-per-buffer", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.samples_per_buffer.to_value())
             }
             subclass::Property("freq1", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.freq1.to_value())
             }
             subclass::Property("vol1", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.vol1.to_value())
             }
             subclass::Property("freq2", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.freq2.to_value())
             }
             subclass::Property("vol2", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.vol2.to_value())
             }
             subclass::Property("on-time1", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.on_time1.to_value())
             }
             subclass::Property("off-time1", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.off_time1.to_value())
             }
             subclass::Property("on-time2", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.on_time2.to_value())
             }
             subclass::Property("off-time2", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.off_time2.to_value())
             }
             subclass::Property("repeat", ..) => {
-                let settings = runtime::executor::block_on(self.settings.lock());
                 Ok(settings.tone_gen_settings.repeat.to_value())
             }
             _ => unimplemented!(),

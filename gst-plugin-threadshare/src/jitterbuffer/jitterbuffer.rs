@@ -41,6 +41,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use crate::get_current_running_time;
@@ -423,7 +424,7 @@ struct JitterBuffer {
     sink_pad: PadSink,
     src_pad: PadSrc,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
+    settings: StdMutex<Settings>,
 }
 
 lazy_static! {
@@ -600,7 +601,7 @@ impl JitterBuffer {
         buffer: gst::Buffer,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
         let (max_misorder_time, max_dropout_time) = {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             (settings.max_misorder_time, settings.max_dropout_time)
         };
 
@@ -776,7 +777,7 @@ impl JitterBuffer {
         discont: &mut bool,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
         let (latency_ns, do_lost) = {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             (
                 settings.latency_ms as i64 * gst::MSECOND.nseconds().unwrap() as i64,
                 settings.do_lost,
@@ -928,7 +929,7 @@ impl JitterBuffer {
 
     async fn schedule(&self, state: &mut MutexGuard<'_, State>, element: &gst::Element) {
         let (latency_ns, context_wait_ns) = {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             (
                 settings.latency_ms as u64 * gst::MSECOND,
                 settings.context_wait as u64 * gst::MSECOND,
@@ -1128,7 +1129,7 @@ impl JitterBuffer {
         gst_info!(CAT, obj: element, "Preparing");
 
         let (context, latency) = {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             let context = Context::acquire(&settings.context, settings.context_wait).unwrap();
             let latency = settings.latency_ms as u64 * gst::MSECOND;
             (context, latency)
@@ -1262,7 +1263,7 @@ impl ObjectSubclass for JitterBuffer {
             sink_pad,
             src_pad,
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
+            settings: StdMutex::new(Settings::default()),
         }
     }
 }
@@ -1276,7 +1277,7 @@ impl ObjectImpl for JitterBuffer {
         match *prop {
             subclass::Property("latency", ..) => {
                 let latency_ms = {
-                    let mut settings = futures::executor::block_on(self.settings.lock());
+                    let mut settings = self.settings.lock().unwrap();
                     settings.latency_ms = value.get_some().expect("type checked upstream");
                     settings.latency_ms as u64
                 };
@@ -1289,26 +1290,26 @@ impl ObjectImpl for JitterBuffer {
                 /* TODO: post message */
             }
             subclass::Property("do-lost", ..) => {
-                let mut settings = futures::executor::block_on(self.settings.lock());
+                let mut settings = self.settings.lock().unwrap();
                 settings.do_lost = value.get_some().expect("type checked upstream");
             }
             subclass::Property("max-dropout-time", ..) => {
-                let mut settings = futures::executor::block_on(self.settings.lock());
+                let mut settings = self.settings.lock().unwrap();
                 settings.max_dropout_time = value.get_some().expect("type checked upstream");
             }
             subclass::Property("max-misorder-time", ..) => {
-                let mut settings = futures::executor::block_on(self.settings.lock());
+                let mut settings = self.settings.lock().unwrap();
                 settings.max_misorder_time = value.get_some().expect("type checked upstream");
             }
             subclass::Property("context", ..) => {
-                let mut settings = futures::executor::block_on(self.settings.lock());
+                let mut settings = self.settings.lock().unwrap();
                 settings.context = value
                     .get()
                     .expect("type checked upstream")
                     .unwrap_or_else(|| "".into());
             }
             subclass::Property("context-wait", ..) => {
-                let mut settings = futures::executor::block_on(self.settings.lock());
+                let mut settings = self.settings.lock().unwrap();
                 settings.context_wait = value.get_some().expect("type checked upstream");
             }
             _ => unimplemented!(),
@@ -1320,19 +1321,19 @@ impl ObjectImpl for JitterBuffer {
 
         match *prop {
             subclass::Property("latency", ..) => {
-                let settings = futures::executor::block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.latency_ms.to_value())
             }
             subclass::Property("do-lost", ..) => {
-                let settings = futures::executor::block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.do_lost.to_value())
             }
             subclass::Property("max-dropout-time", ..) => {
-                let settings = futures::executor::block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.max_dropout_time.to_value())
             }
             subclass::Property("max-misorder-time", ..) => {
-                let settings = futures::executor::block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.max_misorder_time.to_value())
             }
             subclass::Property("stats", ..) => {
@@ -1348,11 +1349,11 @@ impl ObjectImpl for JitterBuffer {
                 Ok(s.to_value())
             }
             subclass::Property("context", ..) => {
-                let settings = futures::executor::block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.context.to_value())
             }
             subclass::Property("context-wait", ..) => {
-                let settings = futures::executor::block_on(self.settings.lock());
+                let settings = self.settings.lock().unwrap();
                 Ok(settings.context_wait.to_value())
             }
             _ => unimplemented!(),

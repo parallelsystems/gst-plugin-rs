@@ -46,6 +46,7 @@ use crate::socket::{wrap_socket, GioSocketWrapper};
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 use std::u16;
 use std::u8;
@@ -154,8 +155,8 @@ struct PreparationSet {
 struct UdpSink {
     sink_pad: PadSink,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
-    preparation_set: Mutex<Option<PreparationSet>>,
+    settings: StdMutex<Settings>,
+    preparation_set: StdMutex<Option<PreparationSet>>,
 }
 
 lazy_static! {
@@ -474,7 +475,7 @@ impl UdpSink {
         element: &gst::Element,
         buffer: &gst::BufferRef,
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-        let do_sync = self.settings.lock().await.sync;
+        let do_sync = self.settings.lock().unwrap().sync;
 
         if do_sync {
             let state = self.state.lock().await;
@@ -564,7 +565,7 @@ impl UdpSink {
         ipv6: bool,
     ) -> Result<(), gst::ErrorMessage> {
         let mut state = self.state.lock().await;
-        let mut settings = self.settings.lock().await;
+        let mut settings = self.settings.lock().unwrap();
 
         let socket = if let Some(ref wrapped_socket) = if ipv6 {
             &settings.socket_v6
@@ -689,7 +690,7 @@ impl UdpSink {
         client: &SocketAddr,
         state: &MutexGuard<'_, State>,
     ) -> Result<(), gst::ErrorMessage> {
-        let settings = self.settings.lock().await;
+        let settings = self.settings.lock().unwrap();
 
         if client.ip().is_multicast() {
             match client.ip() {
@@ -794,7 +795,7 @@ impl UdpSink {
         let mut state = self.state.lock().await;
 
         let context = {
-            let settings = self.settings.lock().await.clone();
+            let settings = self.settings.lock().unwrap();
 
             Context::acquire(&settings.context, settings.context_wait).map_err(|err| {
                 gst_error_msg!(
@@ -804,7 +805,7 @@ impl UdpSink {
             })?
         };
 
-        *self.preparation_set.lock().await = Some(PreparationSet {
+        *self.preparation_set.lock().unwrap() = Some(PreparationSet {
             join_handle: context.spawn(Self::prepare_sockets(element.clone())),
         });
 
@@ -821,7 +822,7 @@ impl UdpSink {
         let PreparationSet { join_handle } = self
             .preparation_set
             .lock()
-            .await
+            .unwrap()
             .take()
             .expect("preparation_set already taken");
 
@@ -998,8 +999,8 @@ impl ObjectSubclass for UdpSink {
 
                 let udpsink = Self::from_instance(&element);
 
-                let settings = block_on(udpsink.settings.lock());
                 let mut state = block_on(udpsink.state.lock());
+                let settings = udpsink.settings.lock().unwrap();
 
                 if Some(&host) != settings.host.as_ref() || port != settings.port as i32 {
                     udpsink.remove_client(&element, &mut state, &host, port as u16);
@@ -1022,7 +1023,7 @@ impl ObjectSubclass for UdpSink {
 
                 let udpsink = Self::from_instance(&element);
                 let mut state = block_on(udpsink.state.lock());
-                let settings = block_on(udpsink.settings.lock());
+                let settings = udpsink.settings.lock().unwrap();
 
                 udpsink.clear_clients(&element, &mut state, &settings);
 
@@ -1040,8 +1041,8 @@ impl ObjectSubclass for UdpSink {
         Self {
             sink_pad,
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
-            preparation_set: Mutex::new(None),
+            settings: StdMutex::new(Settings::default()),
+            preparation_set: StdMutex::new(None),
         }
     }
 }
@@ -1053,9 +1054,9 @@ impl ObjectImpl for UdpSink {
         let prop = &PROPERTIES[id];
         let element = obj.downcast_ref::<gst::Element>().unwrap();
 
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("host", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 let mut state = block_on(self.state.lock());
                 if let Some(host) = &settings.host {
                     self.remove_client(&element, &mut state, &host, settings.port as u16);
@@ -1068,7 +1069,6 @@ impl ObjectImpl for UdpSink {
                 }
             }
             subclass::Property("port", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 let mut state = block_on(self.state.lock());
                 if let Some(host) = &settings.host {
                     self.remove_client(&element, &mut state, &host, settings.port as u16);
@@ -1081,36 +1081,27 @@ impl ObjectImpl for UdpSink {
                 }
             }
             subclass::Property("sync", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.sync = value.get_some().expect("type checked upstream");
             }
             subclass::Property("bind-address", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 settings.bind_address = value
                     .get()
                     .expect("type checked upstream")
                     .unwrap_or_else(|| "".into());
             }
             subclass::Property("bind-port", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.bind_port = value.get_some().expect("type checked upstream");
             }
             subclass::Property("bind-address-v6", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 settings.bind_address_v6 = value
                     .get()
                     .expect("type checked upstream")
                     .unwrap_or_else(|| "".into());
             }
             subclass::Property("bind-port-v6", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.bind_port_v6 = value.get_some().expect("type checked upstream");
             }
             subclass::Property("socket", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 settings.socket = value
                     .get::<gio::Socket>()
                     .expect("type checked upstream")
@@ -1120,7 +1111,6 @@ impl ObjectImpl for UdpSink {
                 unreachable!();
             }
             subclass::Property("socket-v6", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 settings.socket_v6 = value
                     .get::<gio::Socket>()
                     .expect("type checked upstream")
@@ -1130,28 +1120,18 @@ impl ObjectImpl for UdpSink {
                 unreachable!();
             }
             subclass::Property("auto-multicast", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.auto_multicast = value.get_some().expect("type checked upstream");
             }
             subclass::Property("loop", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.multicast_loop = value.get_some().expect("type checked upstream");
             }
             subclass::Property("ttl", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.ttl = value.get_some().expect("type checked upstream");
             }
             subclass::Property("ttl-mc", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.ttl_mc = value.get_some().expect("type checked upstream");
             }
             subclass::Property("qos-dscp", ..) => {
-                let mut settings = block_on(self.settings.lock());
-
                 settings.qos_dscp = value.get_some().expect("type checked upstream");
             }
             subclass::Property("clients", ..) => {
@@ -1161,7 +1141,6 @@ impl ObjectImpl for UdpSink {
                     .unwrap_or_else(|| "".into());
                 let mut state = block_on(self.state.lock());
                 let clients = clients.split(',');
-                let settings = block_on(self.settings.lock());
                 self.clear_clients(element, &mut state, &settings);
 
                 for client in clients {
@@ -1176,14 +1155,12 @@ impl ObjectImpl for UdpSink {
                 }
             }
             subclass::Property("context", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 settings.context = value
                     .get()
                     .expect("type checked upstream")
                     .unwrap_or_else(|| "".into());
             }
             subclass::Property("context-wait", ..) => {
-                let mut settings = block_on(self.settings.lock());
                 settings.context_wait = value.get_some().expect("type checked upstream");
             }
             _ => unimplemented!(),
@@ -1193,37 +1170,30 @@ impl ObjectImpl for UdpSink {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES[id];
 
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("host", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.host.to_value())
             }
             subclass::Property("port", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.port.to_value())
             }
             subclass::Property("sync", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.sync.to_value())
             }
             subclass::Property("bind-address", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.bind_address.to_value())
             }
             subclass::Property("bind-port", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.bind_port.to_value())
             }
             subclass::Property("bind-address-v6", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.bind_address_v6.to_value())
             }
             subclass::Property("bind-port-v6", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.bind_port_v6.to_value())
             }
             subclass::Property("socket", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings
                     .socket
                     .as_ref()
@@ -1231,7 +1201,6 @@ impl ObjectImpl for UdpSink {
                     .to_value())
             }
             subclass::Property("used-socket", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings
                     .used_socket
                     .as_ref()
@@ -1239,7 +1208,6 @@ impl ObjectImpl for UdpSink {
                     .to_value())
             }
             subclass::Property("socket-v6", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings
                     .socket_v6
                     .as_ref()
@@ -1247,7 +1215,6 @@ impl ObjectImpl for UdpSink {
                     .to_value())
             }
             subclass::Property("used-socket-v6", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings
                     .used_socket_v6
                     .as_ref()
@@ -1255,23 +1222,18 @@ impl ObjectImpl for UdpSink {
                     .to_value())
             }
             subclass::Property("auto-multicast", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.sync.to_value())
             }
             subclass::Property("loop", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.multicast_loop.to_value())
             }
             subclass::Property("ttl", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.ttl.to_value())
             }
             subclass::Property("ttl-mc", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.ttl_mc.to_value())
             }
             subclass::Property("qos-dscp", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.qos_dscp.to_value())
             }
             subclass::Property("clients", ..) => {
@@ -1282,11 +1244,9 @@ impl ObjectImpl for UdpSink {
                 Ok(clients.join(",").to_value())
             }
             subclass::Property("context", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.context.to_value())
             }
             subclass::Property("context-wait", ..) => {
-                let settings = block_on(self.settings.lock());
                 Ok(settings.context_wait.to_value())
             }
             _ => unimplemented!(),

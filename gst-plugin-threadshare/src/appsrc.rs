@@ -39,6 +39,7 @@ use rand;
 
 use std::convert::TryInto;
 use std::sync::{self, Arc};
+use std::sync::Mutex as StdMutex;
 use std::u32;
 
 use crate::runtime::prelude::*;
@@ -157,7 +158,7 @@ impl Default for AppSrcPadHandlerState {
 #[derive(Debug, Default)]
 struct AppSrcPadHandlerInner {
     state: sync::RwLock<AppSrcPadHandlerState>,
-    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
+    flush_join_handle: StdMutex<Option<JoinHandle<Result<(), ()>>>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -413,12 +414,13 @@ struct AppSrc {
     src_pad: PadSrc,
     src_pad_handler: AppSrcPadHandler,
     state: Mutex<State>,
-    settings: Mutex<Settings>,
+    settings: StdMutex<Settings>,
 }
 
 impl AppSrc {
     async fn push_buffer(&self, element: &gst::Element, mut buffer: gst::Buffer) -> bool {
-        if self.settings.lock().await.do_timestamp {
+        let do_timestamp = self.settings.lock().unwrap().do_timestamp;
+        if do_timestamp {
             if let Some(clock) = element.get_clock() {
                 let base_time = element.get_base_time();
                 let now = clock.get_time();
@@ -467,7 +469,7 @@ impl AppSrc {
         gst_debug!(CAT, obj: element, "Preparing");
 
         let context = {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
 
             self.src_pad_handler.0.state.write().unwrap().caps = settings.caps.clone();
 
@@ -516,7 +518,7 @@ impl AppSrc {
         let mut state = self.state.lock().await;
         gst_debug!(CAT, obj: element, "Starting");
 
-        let max_buffers = self.settings.lock().await.max_buffers.try_into().unwrap();
+        let max_buffers = self.settings.lock().unwrap().max_buffers.try_into().unwrap();
         let (sender, receiver) = mpsc::channel(max_buffers);
         state.sender = Some(sender);
 
@@ -623,7 +625,7 @@ impl ObjectSubclass for AppSrc {
             src_pad,
             src_pad_handler: AppSrcPadHandler::default(),
             state: Mutex::new(State::default()),
-            settings: Mutex::new(Settings::default()),
+            settings: StdMutex::new(Settings::default()),
         }
     }
 }
@@ -634,7 +636,7 @@ impl ObjectImpl for AppSrc {
     fn set_property(&self, _obj: &glib::Object, id: usize, value: &glib::Value) {
         let prop = &PROPERTIES[id];
 
-        let mut settings = runtime::executor::block_on(self.settings.lock());
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("context", ..) => {
                 settings.context = value
@@ -661,7 +663,7 @@ impl ObjectImpl for AppSrc {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES[id];
 
-        let settings = runtime::executor::block_on(self.settings.lock());
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("context", ..) => Ok(settings.context.to_value()),
             subclass::Property("context-wait", ..) => Ok(settings.context_wait.to_value()),

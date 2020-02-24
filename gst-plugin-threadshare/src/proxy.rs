@@ -36,7 +36,8 @@ use gst::{gst_debug, gst_element_error, gst_error, gst_error_msg, gst_log, gst_t
 use lazy_static::lazy_static;
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{self, Arc, Weak};
+use std::sync::{Arc, Weak};
+use std::sync::Mutex as StdMutex;
 use std::{u32, u64};
 
 use crate::runtime::prelude::*;
@@ -49,10 +50,10 @@ use super::dataqueue::{DataQueue, DataQueueItem};
 lazy_static! {
     static ref PROXY_CONTEXTS: Mutex<HashMap<String, Weak<Mutex<ProxyContextInner>>>> =
         Mutex::new(HashMap::new());
-    static ref PROXY_SRC_PADS: std::sync::Mutex<HashMap<String, PadSrcWeak>> =
-        std::sync::Mutex::new(HashMap::new());
-    static ref PROXY_SINK_PADS: std::sync::Mutex<HashMap<String, PadSinkWeak>> =
-        std::sync::Mutex::new(HashMap::new());
+    static ref PROXY_SRC_PADS: StdMutex<HashMap<String, PadSrcWeak>> =
+        StdMutex::new(HashMap::new());
+    static ref PROXY_SINK_PADS: StdMutex<HashMap<String, PadSinkWeak>> =
+        StdMutex::new(HashMap::new());
 }
 
 const DEFAULT_PROXY_CONTEXT: &str = "";
@@ -302,7 +303,7 @@ impl ProxyContext {
 #[derive(Debug)]
 struct ProxySinkPadHandlerInner {
     proxy_ctx: ProxyContext,
-    flush_rx: sync::Mutex<Option<oneshot::Receiver<()>>>,
+    flush_rx: StdMutex<Option<oneshot::Receiver<()>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,7 +313,7 @@ impl ProxySinkPadHandler {
     fn new(proxy_ctx: ProxyContext) -> Self {
         ProxySinkPadHandler(Arc::new(ProxySinkPadHandlerInner {
             proxy_ctx,
-            flush_rx: sync::Mutex::new(None),
+            flush_rx: StdMutex::new(None),
         }))
     }
 
@@ -473,7 +474,7 @@ impl Default for StateSink {
 struct ProxySink {
     sink_pad: PadSink,
     state: Mutex<StateSink>,
-    settings: Mutex<SettingsSink>,
+    settings: StdMutex<SettingsSink>,
 }
 
 lazy_static! {
@@ -676,7 +677,7 @@ impl ProxySink {
         let mut state = self.state.lock().await;
         gst_debug!(SINK_CAT, obj: element, "Preparing");
 
-        let proxy_context = self.settings.lock().await.proxy_context.to_string();
+        let proxy_context = self.settings.lock().unwrap().proxy_context.to_string();
 
         let proxy_ctx = ProxyContext::get(&proxy_context, true)
             .await
@@ -724,7 +725,7 @@ impl ProxySink {
         gst_debug!(SINK_CAT, obj: element, "Starting");
 
         {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             let mut proxy_sink_pads = PROXY_SINK_PADS.lock().unwrap();
             proxy_sink_pads.remove(&settings.proxy_context);
         }
@@ -788,7 +789,7 @@ impl ObjectSubclass for ProxySink {
         Self {
             sink_pad,
             state: Mutex::new(StateSink::default()),
-            settings: Mutex::new(SettingsSink::default()),
+            settings: StdMutex::new(SettingsSink::default()),
         }
     }
 }
@@ -799,7 +800,7 @@ impl ObjectImpl for ProxySink {
     fn set_property(&self, _obj: &glib::Object, id: usize, value: &glib::Value) {
         let prop = &PROPERTIES_SINK[id];
 
-        let mut settings = runtime::executor::block_on(self.settings.lock());
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("proxy-context", ..) => {
                 settings.proxy_context = value
@@ -814,7 +815,7 @@ impl ObjectImpl for ProxySink {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES_SINK[id];
 
-        let settings = runtime::executor::block_on(self.settings.lock());
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("proxy-context", ..) => Ok(settings.proxy_context.to_value()),
             _ => unimplemented!(),
@@ -869,7 +870,7 @@ impl ElementImpl for ProxySink {
 
 #[derive(Debug)]
 struct ProxySrcPadHandlerInner {
-    flush_join_handle: sync::Mutex<Option<JoinHandle<Result<(), ()>>>>,
+    flush_join_handle: StdMutex<Option<JoinHandle<Result<(), ()>>>>,
     proxy_ctx: ProxyContext,
 }
 
@@ -879,7 +880,7 @@ struct ProxySrcPadHandler(Arc<ProxySrcPadHandlerInner>);
 impl ProxySrcPadHandler {
     fn new(proxy_ctx: ProxyContext) -> Self {
         ProxySrcPadHandler(Arc::new(ProxySrcPadHandlerInner {
-            flush_join_handle: sync::Mutex::new(None),
+            flush_join_handle: StdMutex::new(None),
             proxy_ctx,
         }))
     }
@@ -1152,7 +1153,7 @@ impl Default for StateSrc {
 struct ProxySrc {
     src_pad: PadSrc,
     state: Mutex<StateSrc>,
-    settings: Mutex<SettingsSrc>,
+    settings: StdMutex<SettingsSrc>,
 }
 
 lazy_static! {
@@ -1168,7 +1169,7 @@ impl ProxySrc {
         let mut state = self.state.lock().await;
         gst_debug!(SRC_CAT, obj: element, "Preparing");
 
-        let settings = self.settings.lock().await;
+        let settings = self.settings.lock().unwrap().clone();
 
         let proxy_ctx = ProxyContext::get(&settings.proxy_context, false)
             .await
@@ -1241,7 +1242,7 @@ impl ProxySrc {
         gst_debug!(SRC_CAT, obj: element, "Unpreparing");
 
         {
-            let settings = self.settings.lock().await;
+            let settings = self.settings.lock().unwrap();
             let mut proxy_src_pads = PROXY_SRC_PADS.lock().unwrap();
             proxy_src_pads.remove(&settings.proxy_context);
         }
@@ -1359,7 +1360,7 @@ impl ObjectSubclass for ProxySrc {
         Self {
             src_pad,
             state: Mutex::new(StateSrc::default()),
-            settings: Mutex::new(SettingsSrc::default()),
+            settings: StdMutex::new(SettingsSrc::default()),
         }
     }
 }
@@ -1370,7 +1371,7 @@ impl ObjectImpl for ProxySrc {
     fn set_property(&self, _obj: &glib::Object, id: usize, value: &glib::Value) {
         let prop = &PROPERTIES_SRC[id];
 
-        let mut settings = runtime::executor::block_on(self.settings.lock());
+        let mut settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("max-size-buffers", ..) => {
                 settings.max_size_buffers = value.get_some().expect("type checked upstream");
@@ -1403,7 +1404,7 @@ impl ObjectImpl for ProxySrc {
     fn get_property(&self, _obj: &glib::Object, id: usize) -> Result<glib::Value, ()> {
         let prop = &PROPERTIES_SRC[id];
 
-        let settings = runtime::executor::block_on(self.settings.lock());
+        let settings = self.settings.lock().unwrap();
         match *prop {
             subclass::Property("max-size-buffers", ..) => Ok(settings.max_size_buffers.to_value()),
             subclass::Property("max-size-bytes", ..) => Ok(settings.max_size_bytes.to_value()),
