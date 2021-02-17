@@ -63,7 +63,7 @@ stages:
   - .fdo.container-build@debian
   stage: prep
   variables:
-    FDO_DISTRIBUTION_PACKAGES: "libcsound64-dev llvm clang nasm libsodium-dev"
+    FDO_DISTRIBUTION_PACKAGES: "libcsound64-dev llvm clang nasm libsodium-dev libspandsp-dev"
     FDO_DISTRIBUTION_EXEC: >-
       bash ci/install-dav1d.sh &&
       apt clean &&

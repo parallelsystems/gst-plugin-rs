@@ -1,6 +1,7 @@
 fn main() {
     let gstreamer = pkg_config::probe_library("gstreamer-1.0").unwrap();
     let gstrtp = pkg_config::probe_library("gstreamer-rtp-1.0").unwrap();
+    let spandsp = pkg_config::probe_library("spandsp").unwrap();
     let includes = [gstreamer.include_paths, gstrtp.include_paths];
 
     let mut build = cc::Build::new();
@@ -20,7 +21,7 @@ fn main() {
 
     println!("cargo:rustc-link-lib=dylib=gstrtp-1.0");
 
-    for path in gstrtp.link_paths.iter() {
+    for path in Iterator::chain(gstrtp.link_paths.iter(), spandsp.link_paths.iter()) {
         println!(
             "cargo:rustc-link-search=native={}",
             path.to_str().expect("library path doesn't exist")
