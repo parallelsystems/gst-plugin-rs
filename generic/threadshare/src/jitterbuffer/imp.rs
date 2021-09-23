@@ -1168,7 +1168,7 @@ impl TaskImpl for JitterBufferTask {
                     if let Some((next_wakeup, _)) = next_wakeup {
                         if next_wakeup
                             .zip(now)
-                            .map_or(false, |(next_wakeup, now)| next_wakeup > now)
+                            .map_or(false, |(next_wakeup, now)| next_wakeup > now + context_wait / 2)
                         {
                             // Reschedule and wait a bit longer in the next iteration
                             return Ok(());
