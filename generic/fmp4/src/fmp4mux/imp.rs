@@ -518,8 +518,7 @@ impl FMP4Mux {
         }
 
         let mut drain_buffers = Vec::with_capacity(state.streams.len());
-        let mut timing_infos = Vec::with_capacity(state.streams.len());
-        let mut caps = Vec::with_capacity(state.streams.len());
+        let mut streams = Vec::with_capacity(state.streams.len());
 
         let mut min_earliest_pts_position = None;
         let mut min_earliest_pts = None;
@@ -558,7 +557,7 @@ impl FMP4Mux {
             stream.fragment_filled = false;
 
             if gops.is_empty() {
-                timing_infos.push(None);
+                streams.push((&stream.sinkpad, &stream.caps, None));
             } else {
                 let first_gop = gops.first().unwrap();
                 let last_gop = gops.last().unwrap();
@@ -616,17 +615,18 @@ impl FMP4Mux {
                         .unwrap_or(gst::ClockTime::ZERO)
                 );
 
-                timing_infos.push(Some(super::FragmentTimingInfo {
-                    earliest_pts,
-                    start_dts,
-                    end_pts,
-                    end_dts,
-                    dts_offset,
-                }));
+                streams.push((
+                    &stream.sinkpad,
+                    &stream.caps,
+                    Some(super::FragmentTimingInfo {
+                        earliest_pts,
+                        start_dts,
+                        end_pts,
+                        end_dts,
+                        dts_offset,
+                    }),
+                ));
             }
-
-            caps.push(&stream.caps);
-
             let mut buffers = VecDeque::with_capacity(gops.iter().map(|g| g.buffers.len()).sum());
             for gop in gops {
                 for buffer in gop.buffers {
@@ -678,7 +678,7 @@ impl FMP4Mux {
                     current_end_time = match bs.front() {
                         Some(next_buffer) => next_buffer.dts.unwrap_or(next_buffer.pts),
                         None => {
-                            let timing_info = timing_infos[idx].as_ref().unwrap();
+                            let timing_info = streams[idx].2.as_ref().unwrap();
                             timing_info.end_dts.unwrap_or(timing_info.end_pts)
                         }
                     };
@@ -739,8 +739,7 @@ impl FMP4Mux {
                 boxes::create_fmp4_fragment_header(super::FragmentHeaderConfiguration {
                     variant: class.as_ref().variant,
                     sequence_number,
-                    caps: caps.as_slice(),
-                    timing_infos: timing_infos.as_slice(),
+                    streams: streams.as_slice(),
                     buffers: interleaved_buffers.as_slice(),
                 })
                 .map_err(|err| {
@@ -803,7 +802,7 @@ impl FMP4Mux {
 
             // Write mfra only for the main stream, and if there are no buffers for the main stream
             // in this segment then don't write anything.
-            if let Some(Some(ref timing_info)) = timing_infos.get(0) {
+            if let Some((_pad, _caps, Some(ref timing_info))) = streams.get(0) {
                 state.fragment_offsets.push(super::FragmentOffset {
                     time: timing_info.earliest_pts,
                     offset: moof_offset,
@@ -818,7 +817,7 @@ impl FMP4Mux {
         }
 
         if settings.write_mfra && at_eos {
-            match boxes::create_mfra(caps[0], &state.fragment_offsets) {
+            match boxes::create_mfra(streams[0].1, &state.fragment_offsets) {
                 Ok(mut mfra) => {
                     {
                         let mfra = mfra.get_mut().unwrap();
@@ -962,12 +961,17 @@ impl FMP4Mux {
             .ok()
             .flatten();
 
-        let caps = state.streams.iter().map(|s| &s.caps).collect::<Vec<_>>();
+        let streams = state
+            .streams
+            .iter()
+            .map(|s| (&s.sinkpad, &s.caps))
+            .collect::<Vec<_>>();
 
         let mut buffer = boxes::create_fmp4_header(super::HeaderConfiguration {
+            element,
             variant,
             update: at_eos,
-            caps: caps.as_slice(),
+            streams: streams.as_slice(),
             write_mehd: settings.write_mehd,
             duration: if at_eos { duration } else { None },
         })
@@ -1913,7 +1917,31 @@ impl FMP4MuxImpl for DASHMP4Mux {
 }
 
 #[derive(Default)]
-pub(crate) struct ONVIFFMP4Mux;
+pub(crate) struct ONVIFFMP4Mux {
+    pub(crate) settings: Mutex<ONVIFFMP4MuxSettings>,
+}
+
+pub(crate) struct ONVIFFMP4MuxSettings {
+    pub(crate) fragment_uuid: uuid::Uuid,
+    pub(crate) predecessor_uuid: uuid::Uuid,
+    pub(crate) successor_uuid: uuid::Uuid,
+    pub(crate) predecessor_uri: Option<String>,
+    pub(crate) successor_uri: Option<String>,
+}
+
+impl Default for ONVIFFMP4MuxSettings {
+    fn default() -> Self {
+        let uuid = uuid::Uuid::new_v4();
+
+        ONVIFFMP4MuxSettings {
+            fragment_uuid: uuid,
+            predecessor_uuid: uuid,
+            successor_uuid: uuid,
+            predecessor_uri: None,
+            successor_uri: None,
+        }
+    }
+}
 
 #[glib::object_subclass]
 impl ObjectSubclass for ONVIFFMP4Mux {
@@ -1922,7 +1950,163 @@ impl ObjectSubclass for ONVIFFMP4Mux {
     type ParentType = super::FMP4Mux;
 }
 
-impl ObjectImpl for ONVIFFMP4Mux {}
+impl ObjectImpl for ONVIFFMP4Mux {
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
+            vec![
+                glib::ParamSpecString::new(
+                    "fragment-uuid",
+                    "Fragment UUID",
+                    "Fragment UUID",
+                    None,
+                    glib::ParamFlags::READWRITE | gst::PARAM_FLAG_MUTABLE_READY,
+                ),
+                glib::ParamSpecString::new(
+                    "predecessor-uuid",
+                    "Predecessor UUID",
+                    "Predecessor UUID",
+                    None,
+                    glib::ParamFlags::READWRITE | gst::PARAM_FLAG_MUTABLE_READY,
+                ),
+                glib::ParamSpecString::new(
+                    "successor-uuid",
+                    "Successor UUID",
+                    "Successor UUID",
+                    None,
+                    glib::ParamFlags::READWRITE | gst::PARAM_FLAG_MUTABLE_READY,
+                ),
+                glib::ParamSpecString::new(
+                    "predecessor-uri",
+                    "Predecessor URI",
+                    "Predecessor URI",
+                    None,
+                    glib::ParamFlags::READWRITE | gst::PARAM_FLAG_MUTABLE_READY,
+                ),
+                glib::ParamSpecString::new(
+                    "successor-uri",
+                    "Successor URI",
+                    "Successor URI",
+                    None,
+                    glib::ParamFlags::READWRITE | gst::PARAM_FLAG_MUTABLE_READY,
+                ),
+            ]
+        });
+
+        &*PROPERTIES
+    }
+
+    fn set_property(
+        &self,
+        obj: &Self::Type,
+        _id: usize,
+        value: &glib::Value,
+        pspec: &glib::ParamSpec,
+    ) {
+        match pspec.name() {
+            "fragment-uuid" => {
+                let mut settings = self.settings.lock().unwrap();
+                let uuid_str = value.get().expect("type checked upstream");
+                match uuid::Uuid::parse_str(uuid_str) {
+                    Ok(uuid) => {
+                        settings.fragment_uuid = uuid;
+                    }
+                    Err(err) => {
+                        gst::warning!(
+                            CAT,
+                            obj: obj,
+                            "Can't parse UUID string '{}': {}",
+                            uuid_str,
+                            err
+                        );
+                    }
+                }
+            }
+            "predecessor-uuid" => {
+                let mut settings = self.settings.lock().unwrap();
+                let uuid_str = value.get().expect("type checked upstream");
+                match uuid::Uuid::parse_str(uuid_str) {
+                    Ok(uuid) => {
+                        settings.predecessor_uuid = uuid;
+                    }
+                    Err(err) => {
+                        gst::warning!(
+                            CAT,
+                            obj: obj,
+                            "Can't parse UUID string '{}': {}",
+                            uuid_str,
+                            err
+                        );
+                    }
+                }
+            }
+            "successor-uuid" => {
+                let mut settings = self.settings.lock().unwrap();
+                let uuid_str = value.get().expect("type checked upstream");
+                match uuid::Uuid::parse_str(uuid_str) {
+                    Ok(uuid) => {
+                        settings.successor_uuid = uuid;
+                    }
+                    Err(err) => {
+                        gst::warning!(
+                            CAT,
+                            obj: obj,
+                            "Can't parse UUID string '{}': {}",
+                            uuid_str,
+                            err
+                        );
+                    }
+                }
+            }
+            "predecessor-uri" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.predecessor_uri = value.get().expect("type checked upstream");
+            }
+            "successor-uri" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.successor_uri = value.get().expect("type checked upstream");
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn property(&self, _obj: &Self::Type, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        match pspec.name() {
+            "fragment-uuid" => {
+                let settings = self.settings.lock().unwrap();
+                settings
+                    .fragment_uuid
+                    .as_hyphenated()
+                    .to_string()
+                    .to_value()
+            }
+            "predecessor-uuid" => {
+                let settings = self.settings.lock().unwrap();
+                settings
+                    .predecessor_uuid
+                    .as_hyphenated()
+                    .to_string()
+                    .to_value()
+            }
+            "successor-uuid" => {
+                let settings = self.settings.lock().unwrap();
+                settings
+                    .successor_uuid
+                    .as_hyphenated()
+                    .to_string()
+                    .to_value()
+            }
+            "predecessor-uri" => {
+                let settings = self.settings.lock().unwrap();
+                settings.predecessor_uri.to_value()
+            }
+            "successor-uri" => {
+                let settings = self.settings.lock().unwrap();
+                settings.successor_uri.to_value()
+            }
+            _ => unimplemented!(),
+        }
+    }
+}
 
 impl GstObjectImpl for ONVIFFMP4Mux {}
 
@@ -1952,7 +2136,7 @@ impl ElementImpl for ONVIFFMP4Mux {
             )
             .unwrap();
 
-            let sink_pad_template = gst::PadTemplate::new(
+            let sink_pad_template = gst::PadTemplate::with_gtype(
                 "sink_%u",
                 gst::PadDirection::Sink,
                 gst::PadPresence::Request,
@@ -1999,6 +2183,7 @@ impl ElementImpl for ONVIFFMP4Mux {
                 ]
                 .into_iter()
                 .collect::<gst::Caps>(),
+                super::ONVIFFMP4MuxPad::static_type(),
             )
             .unwrap();
 
@@ -2014,3 +2199,90 @@ impl AggregatorImpl for ONVIFFMP4Mux {}
 impl FMP4MuxImpl for ONVIFFMP4Mux {
     const VARIANT: super::Variant = super::Variant::ONVIF;
 }
+
+#[derive(Default)]
+pub(crate) struct ONVIFFMP4MuxPad {
+    pub(crate) settings: Mutex<ONVIFFMP4MuxPadSettings>,
+}
+
+pub(crate) struct ONVIFFMP4MuxPadSettings {
+    pub(crate) camera_uuid: uuid::Uuid,
+}
+
+impl Default for ONVIFFMP4MuxPadSettings {
+    fn default() -> Self {
+        ONVIFFMP4MuxPadSettings {
+            camera_uuid: uuid::Uuid::new_v4(),
+        }
+    }
+}
+
+#[glib::object_subclass]
+impl ObjectSubclass for ONVIFFMP4MuxPad {
+    const NAME: &'static str = "GstONVIFFMP4MuxPad";
+    type Type = super::ONVIFFMP4MuxPad;
+    type ParentType = gst_base::AggregatorPad;
+}
+
+impl ObjectImpl for ONVIFFMP4MuxPad {
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: Lazy<Vec<glib::ParamSpec>> = Lazy::new(|| {
+            vec![glib::ParamSpecString::new(
+                "camera-uuid",
+                "Camera/microphone Identification",
+                "Camera/microphone UUID",
+                None,
+                glib::ParamFlags::READWRITE | gst::PARAM_FLAG_MUTABLE_READY,
+            )]
+        });
+
+        &*PROPERTIES
+    }
+
+    fn set_property(
+        &self,
+        obj: &Self::Type,
+        _id: usize,
+        value: &glib::Value,
+        pspec: &glib::ParamSpec,
+    ) {
+        match pspec.name() {
+            "camera-uuid" => {
+                let mut settings = self.settings.lock().unwrap();
+                let uuid_str = value.get().expect("type checked upstream");
+                match uuid::Uuid::parse_str(uuid_str) {
+                    Ok(uuid) => {
+                        settings.camera_uuid = uuid;
+                    }
+                    Err(err) => {
+                        gst::warning!(
+                            CAT,
+                            obj: obj,
+                            "Can't parse UUID string '{}': {}",
+                            uuid_str,
+                            err
+                        );
+                    }
+                }
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    fn property(&self, _obj: &Self::Type, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        match pspec.name() {
+            "camera-uuid" => {
+                let settings = self.settings.lock().unwrap();
+                settings.camera_uuid.as_hyphenated().to_string().to_value()
+            }
+
+            _ => unimplemented!(),
+        }
+    }
+}
+
+impl GstObjectImpl for ONVIFFMP4MuxPad {}
+
+impl PadImpl for ONVIFFMP4MuxPad {}
+
+impl AggregatorPadImpl for ONVIFFMP4MuxPad {}

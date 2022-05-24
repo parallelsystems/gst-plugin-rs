@@ -32,6 +32,10 @@ glib::wrapper! {
     pub(crate) struct ONVIFFMP4Mux(ObjectSubclass<imp::ONVIFFMP4Mux>) @extends FMP4Mux, gst_base::Aggregator, gst::Element, gst::Object;
 }
 
+glib::wrapper! {
+    pub(crate) struct ONVIFFMP4MuxPad(ObjectSubclass<imp::ONVIFFMP4MuxPad>) @extends gst_base::AggregatorPad, gst::Pad, gst::Object;
+}
+
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     gst::Element::register(
         Some(plugin),
@@ -74,10 +78,11 @@ pub(crate) struct Buffer {
 #[derive(Debug)]
 pub(crate) struct HeaderConfiguration<'a> {
     variant: Variant,
+    element: &'a FMP4Mux,
     update: bool,
     /// First caps must be the video/reference stream. Must be in the order the tracks are going to
     /// be used later for the fragments too.
-    caps: &'a [&'a gst::Caps],
+    streams: &'a [(&'a gst_base::AggregatorPad, &'a gst::Caps)],
     write_mehd: bool,
     duration: Option<gst::ClockTime>,
 }
@@ -96,8 +101,11 @@ pub(crate) struct FragmentTimingInfo {
 pub(crate) struct FragmentHeaderConfiguration<'a> {
     variant: Variant,
     sequence_number: u32,
-    caps: &'a [&'a gst::Caps],
-    timing_infos: &'a [Option<FragmentTimingInfo>],
+    streams: &'a [(
+        &'a gst_base::AggregatorPad,
+        &'a gst::Caps,
+        Option<FragmentTimingInfo>,
+    )],
     buffers: &'a [Buffer],
 }
 

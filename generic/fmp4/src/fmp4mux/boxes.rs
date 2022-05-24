@@ -6,6 +6,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
+use gst::glib::subclass::prelude::*;
 use gst::prelude::*;
 
 use anyhow::{anyhow, bail, Context, Error};
@@ -330,9 +331,9 @@ fn cmaf_brands_from_caps(caps: &gst::CapsRef, compatible_brands: &mut Vec<&'stat
     }
 }
 
-fn brands_from_variant_and_caps(
+fn brands_from_variant_and_caps<'a>(
     variant: super::Variant,
-    caps: &[&gst::Caps],
+    mut caps: impl Iterator<Item = &'a gst::Caps>,
 ) -> (&'static [u8; 4], Vec<&'static [u8; 4]>) {
     match variant {
         super::Variant::ISO => (b"iso6", vec![b"iso6"]),
@@ -343,8 +344,8 @@ fn brands_from_variant_and_caps(
         super::Variant::CMAF => {
             let mut compatible_brands = vec![b"iso6", b"cmfc"];
 
-            assert_eq!(caps.len(), 1);
-            cmaf_brands_from_caps(caps[0], &mut compatible_brands);
+            cmaf_brands_from_caps(caps.next().unwrap(), &mut compatible_brands);
+            assert_eq!(caps.next(), None);
 
             (b"cmf2", compatible_brands)
         }
@@ -356,7 +357,8 @@ fn brands_from_variant_and_caps(
 pub(super) fn create_fmp4_header(cfg: super::HeaderConfiguration) -> Result<gst::Buffer, Error> {
     let mut v = vec![];
 
-    let (brand, compatible_brands) = brands_from_variant_and_caps(cfg.variant, cfg.caps);
+    let (brand, compatible_brands) =
+        brands_from_variant_and_caps(cfg.variant, cfg.streams.iter().map(|s| s.1));
 
     write_box(&mut v, b"ftyp", |v| {
         // major brand
@@ -385,7 +387,7 @@ fn write_moov(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), E
     write_full_box(v, b"mvhd", FULL_BOX_VERSION_1, FULL_BOX_FLAGS_NONE, |v| {
         write_mvhd(v, cfg, creation_time)
     })?;
-    for (idx, caps) in cfg.caps.iter().enumerate() {
+    for (idx, (pad, caps)) in cfg.streams.iter().enumerate() {
         write_box(v, b"trak", |v| {
             let mut references = vec![];
 
@@ -394,7 +396,7 @@ fn write_moov(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), E
                 && caps.structure(0).unwrap().name() == "application/x-onvif-metadata"
             {
                 // Find the first video track
-                for (idx, caps) in cfg.caps.iter().enumerate() {
+                for (idx, (_pad, caps)) in cfg.streams.iter().enumerate() {
                     let s = caps.structure(0).unwrap();
 
                     if matches!(s.name(), "video/x-h264" | "video/x-h265" | "image/jpeg") {
@@ -407,10 +409,86 @@ fn write_moov(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), E
                 }
             }
 
-            write_trak(v, cfg, idx, caps, creation_time, &references)
+            write_trak(v, cfg, idx, pad, caps, creation_time, &references)
         })?;
     }
     write_box(v, b"mvex", |v| write_mvex(v, cfg))?;
+
+    if cfg.variant == super::Variant::ONVIF {
+        write_full_box(v, b"meta", FULL_BOX_VERSION_0, FULL_BOX_FLAGS_NONE, |v| {
+            write_full_box(v, b"hdlr", FULL_BOX_VERSION_0, FULL_BOX_FLAGS_NONE, |v| {
+                // Handler type
+                v.extend(b"null");
+
+                // Reserved
+                v.extend([0u8; 3 * 4]);
+
+                // Name
+                v.extend(b"MetadataHandler");
+
+                Ok(())
+            })?;
+
+            write_box(v, b"sumi", |v| {
+                let settings = cfg
+                    .element
+                    .downcast_ref::<super::ONVIFFMP4Mux>()
+                    .unwrap()
+                    .imp()
+                    .settings
+                    .lock()
+                    .unwrap();
+
+                // Fragment UUID
+                v.extend(settings.fragment_uuid.as_bytes());
+
+                // Predecessor Fragment UUID
+                v.extend(settings.predecessor_uuid.as_bytes());
+
+                // Successor Fragment UUID
+                v.extend(settings.successor_uuid.as_bytes());
+
+                // FIXME: Get these somehow
+                // UTC start time
+                v.extend(0u64.to_be_bytes());
+
+                // UTC duration
+                v.extend(0u64.to_be_bytes());
+
+                // predecessor URI size
+                v.extend(
+                    (settings
+                        .predecessor_uri
+                        .as_ref()
+                        .map(|s| s.len() + 1)
+                        .unwrap_or(0) as u16)
+                        .to_be_bytes(),
+                );
+
+                // successor URI size
+                v.extend(
+                    (settings
+                        .successor_uri
+                        .as_ref()
+                        .map(|s| s.len() + 1)
+                        .unwrap_or(0) as u16)
+                        .to_be_bytes(),
+                );
+
+                if let Some(ref predecessor_uri) = settings.predecessor_uri {
+                    v.extend(predecessor_uri.as_bytes());
+                    v.push(0);
+                }
+
+                if let Some(ref successor_uri) = settings.successor_uri {
+                    v.extend(successor_uri.as_bytes());
+                    v.push(0);
+                }
+
+                Ok(())
+            })
+        })?;
+    }
 
     Ok(())
 }
@@ -454,7 +532,7 @@ fn write_mvhd(
     // Modification time
     v.extend(creation_time.to_be_bytes());
     // Timescale: uses the reference track timescale
-    v.extend(caps_to_timescale(cfg.caps[0]).to_be_bytes());
+    v.extend(caps_to_timescale(cfg.streams[0].1).to_be_bytes());
     // Duration
     v.extend(0u64.to_be_bytes());
 
@@ -486,7 +564,7 @@ fn write_mvhd(
     v.extend([0u8; 6 * 4]);
 
     // Next track id
-    v.extend((cfg.caps.len() as u32 + 1).to_be_bytes());
+    v.extend((cfg.streams.len() as u32 + 1).to_be_bytes());
 
     Ok(())
 }
@@ -504,6 +582,7 @@ fn write_trak(
     v: &mut Vec<u8>,
     cfg: &super::HeaderConfiguration,
     idx: usize,
+    pad: &gst_base::AggregatorPad,
     caps: &gst::CapsRef,
     creation_time: u64,
     references: &[TrackReference],
@@ -523,6 +602,38 @@ fn write_trak(
 
     if !references.is_empty() {
         write_box(v, b"tref", |v| write_tref(v, cfg, references))?;
+    }
+
+    if cfg.variant == super::Variant::ONVIF {
+        write_box(v, b"meta", |v| {
+            write_full_box(v, b"hdlr", FULL_BOX_VERSION_0, FULL_BOX_FLAGS_NONE, |v| {
+                // Handler type
+                v.extend(b"null");
+
+                // Reserved
+                v.extend([0u8; 3 * 4]);
+
+                // Name
+                v.extend(b"MetadataHandler");
+
+                Ok(())
+            })?;
+
+            write_box(v, b"cami", |v| {
+                let settings = pad
+                    .downcast_ref::<super::ONVIFFMP4MuxPad>()
+                    .unwrap()
+                    .imp()
+                    .settings
+                    .lock()
+                    .unwrap();
+
+                // Camera/microphone UUID
+                v.extend(settings.camera_uuid.as_bytes());
+
+                Ok(())
+            })
+        })?;
     }
 
     Ok(())
@@ -1388,7 +1499,7 @@ fn write_mvex(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), E
         }
     }
 
-    for (idx, _caps) in cfg.caps.iter().enumerate() {
+    for (idx, (_pad, _caps)) in cfg.streams.iter().enumerate() {
         write_full_box(v, b"trex", FULL_BOX_VERSION_0, FULL_BOX_FLAGS_NONE, |v| {
             write_trex(v, cfg, idx)
         })?;
@@ -1399,7 +1510,7 @@ fn write_mvex(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), E
 
 fn write_mehd(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), Error> {
     // Use the reference track timescale
-    let timescale = caps_to_timescale(cfg.caps[0]);
+    let timescale = caps_to_timescale(cfg.streams[0].1);
 
     let duration = cfg
         .duration
@@ -1441,7 +1552,8 @@ pub(super) fn create_fmp4_fragment_header(
 ) -> Result<(gst::Buffer, u64), Error> {
     let mut v = vec![];
 
-    let (brand, compatible_brands) = brands_from_variant_and_caps(cfg.variant, cfg.caps);
+    let (brand, compatible_brands) =
+        brands_from_variant_and_caps(cfg.variant, cfg.streams.iter().map(|s| s.1));
 
     write_box(&mut v, b"styp", |v| {
         // major brand
@@ -1493,14 +1605,15 @@ fn write_moof(
     })?;
 
     let mut data_offset_offsets = vec![];
-    for (idx, caps) in cfg.caps.iter().enumerate() {
+    for (idx, (_pad, caps, timing_info)) in cfg.streams.iter().enumerate() {
         // Skip tracks without any buffers for this fragment.
-        if cfg.timing_infos[idx].is_none() {
-            continue;
-        }
+        let timing_info = match timing_info {
+            None => continue,
+            Some(ref timing_info) => timing_info,
+        };
 
         write_box(v, b"traf", |v| {
-            write_traf(v, cfg, &mut data_offset_offsets, idx, caps)
+            write_traf(v, cfg, &mut data_offset_offsets, idx, caps, timing_info)
         })?;
     }
 
@@ -1607,6 +1720,7 @@ const SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT: u32 = 0x8_00;
 fn analyze_buffers(
     cfg: &super::FragmentHeaderConfiguration,
     idx: usize,
+    timing_info: &super::FragmentTimingInfo,
     check_dts: bool,
     intra_only: bool,
     timescale: u32,
@@ -1700,7 +1814,6 @@ fn analyze_buffers(
 
     // Check duration of the last buffer against end_pts / end_dts
     {
-        let timing_info = cfg.timing_infos[idx].as_ref().unwrap();
         let current_timestamp = if check_dts {
             timing_info.end_dts.expect("no end DTS")
         } else {
@@ -1766,6 +1879,7 @@ fn write_traf(
     data_offset_offsets: &mut Vec<usize>,
     idx: usize,
     caps: &gst::CapsRef,
+    timing_info: &super::FragmentTimingInfo,
 ) -> Result<(), Error> {
     let s = caps.structure(0).unwrap();
     let timescale = caps_to_timescale(caps);
@@ -1790,7 +1904,7 @@ fn write_traf(
         default_duration,
         default_flags,
         negative_composition_time_offsets,
-    ) = analyze_buffers(cfg, idx, check_dts, intra_only, timescale)?;
+    ) = analyze_buffers(cfg, idx, timing_info, check_dts, intra_only, timescale)?;
 
     assert!((tf_flags & DEFAULT_SAMPLE_SIZE_PRESENT == 0) ^ default_size.is_some());
     assert!((tf_flags & DEFAULT_SAMPLE_DURATION_PRESENT == 0) ^ default_duration.is_some());
@@ -1800,7 +1914,7 @@ fn write_traf(
         write_tfhd(v, cfg, idx, default_size, default_duration, default_flags)
     })?;
     write_full_box(v, b"tfdt", FULL_BOX_VERSION_1, FULL_BOX_FLAGS_NONE, |v| {
-        write_tfdt(v, cfg, idx, timescale)
+        write_tfdt(v, cfg, idx, timing_info, timescale)
     })?;
 
     let mut current_data_offset = 0;
@@ -1820,7 +1934,6 @@ fn write_traf(
                 timestamp_from_pts_dts(*pts, *dts, check_dts, timescale)
                     .map(|(current_timestamp, _pts, _dts)| current_timestamp)?
             } else {
-                let timing_info = cfg.timing_infos[idx].as_ref().unwrap();
                 let last_end_timestamp = if check_dts {
                     timing_info.end_dts.expect("no end DTS")
                 } else {
@@ -1899,12 +2012,11 @@ fn write_tfhd(
 
 fn write_tfdt(
     v: &mut Vec<u8>,
-    cfg: &super::FragmentHeaderConfiguration,
-    idx: usize,
+    _cfg: &super::FragmentHeaderConfiguration,
+    _idx: usize,
+    timing_info: &super::FragmentTimingInfo,
     timescale: u32,
 ) -> Result<(), Error> {
-    let timing_info = cfg.timing_infos[idx].as_ref().unwrap();
-
     let base_time = timing_info
         .start_dts
         .unwrap_or(timing_info.earliest_pts)
