@@ -335,7 +335,7 @@ fn brands_from_variant_and_caps(
     caps: &[&gst::Caps],
 ) -> (&'static [u8; 4], Vec<&'static [u8; 4]>) {
     match variant {
-        super::Variant::ISO | super::Variant::ONVIF => (b"iso6", vec![b"iso6"]),
+        super::Variant::ISO => (b"iso6", vec![b"iso6"]),
         super::Variant::DASH => {
             // FIXME: `dsms` / `dash` brands, `msix`
             (b"msdh", vec![b"dums", b"msdh", b"iso6"])
@@ -348,6 +348,7 @@ fn brands_from_variant_and_caps(
 
             (b"cmf2", compatible_brands)
         }
+        super::Variant::ONVIF => (b"sff1", vec![b"sff1", b"iso6"]),
     }
 }
 
