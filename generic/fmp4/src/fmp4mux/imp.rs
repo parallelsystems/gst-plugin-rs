@@ -23,6 +23,24 @@ use super::Buffer;
 /// Offset for the segment in non-single-stream variants.
 const SEGMENT_OFFSET: gst::ClockTime = gst::ClockTime::from_seconds(60 * 60 * 1000);
 
+/// Offset between MP4 and UNIX epoch in seconds.
+/// MP4 = UNIX + MP4_UNIX_OFFSET.
+const MP4_UNIX_OFFSET: u64 = 2_082_844_800;
+
+/// Offset between NTP and MP4 epoch in seconds.
+/// NTP = MP4 + NTP_MP4_OFFSET.
+const NTP_MP4_OFFSET: u64 = 126_144_000;
+
+/// Offset between NTP and UNIX epoch in seconds.
+/// NTP = UNIX + NTP_UNIX_OFFSET.
+const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
+
+/// Reference timestamp meta caps for NTP timestamps.
+static NTP_CAPS: Lazy<gst::Caps> = Lazy::new(|| gst::Caps::builder("timestamp/x-ntp").build());
+
+/// Reference timestamp meta caps for UNIX timestamps.
+static UNIX_CAPS: Lazy<gst::Caps> = Lazy::new(|| gst::Caps::builder("timestamp/x-unix").build());
+
 static CAT: Lazy<gst::DebugCategory> = Lazy::new(|| {
     gst::DebugCategory::new(
         "fmp4mux",
@@ -124,6 +142,11 @@ struct State {
 
     // Start PTS of the current fragment
     fragment_start_pts: Option<gst::ClockTime>,
+
+    // In ONVIF mode the UTC time corresponding to the beginning of the stream
+    // Since Jan 1 1904
+    start_utc_time: Option<gst::ClockTime>,
+    end_utc_time: Option<gst::ClockTime>,
 
     sent_headers: bool,
 }
@@ -698,6 +721,232 @@ impl FMP4Mux {
             }
         }
 
+        let mut max_end_utc_time = None;
+        // For ONVIF, replace all timestamps with timestamps based on UTC times.
+        if class.as_ref().variant == super::Variant::ONVIF {
+            let calculate_pts = |buffer: &Buffer| -> gst::ClockTime {
+                let composition_time_offset = buffer.composition_time_offset.unwrap_or(0);
+                if composition_time_offset > 0 {
+                    buffer.timestamp + gst::ClockTime::from_nseconds(composition_time_offset as u64)
+                } else {
+                    buffer
+                        .timestamp
+                        .checked_sub(gst::ClockTime::from_nseconds(
+                            (-composition_time_offset) as u64,
+                        ))
+                        .unwrap()
+                }
+            };
+
+            // If this is the first fragment then allow the first buffers to not have a reference
+            // timestamp meta and backdate them
+            if state.stream_header.is_none() {
+                for (idx, drain_buffers) in drain_buffers.iter_mut().enumerate() {
+                    let (buffer_idx, utc_time, buffer) =
+                        match drain_buffers.iter().enumerate().find_map(|(idx, buffer)| {
+                            buffer
+                                .buffer
+                                .iter_meta::<gst::ReferenceTimestampMeta>()
+                                .find_map(|meta| {
+                                    if meta.reference().can_intersect(&UNIX_CAPS) {
+                                        Some((idx, meta.timestamp(), buffer))
+                                    } else if meta.reference().can_intersect(&NTP_CAPS) {
+                                        meta.timestamp()
+                                            .checked_sub(gst::ClockTime::from_seconds(
+                                                NTP_UNIX_OFFSET,
+                                            ))
+                                            .map(|timestamp| (idx, timestamp, buffer))
+                                    } else {
+                                        None
+                                    }
+                                })
+                        }) {
+                            None => {
+                                gst::error!(
+                                    CAT,
+                                    obj: &state.streams[idx].sinkpad,
+                                    "No reference timestamp set in first fragment"
+                                );
+                                return Err(gst::FlowError::Error);
+                            }
+                            Some(res) => res,
+                        };
+
+                    if buffer_idx > 0 {
+                        let utc_time_pts = calculate_pts(buffer);
+
+                        for buffer in drain_buffers.iter_mut().take(buffer_idx) {
+                            let buffer_pts = calculate_pts(buffer);
+                            let buffer_pts_diff = if utc_time_pts >= buffer_pts {
+                                (utc_time_pts - buffer_pts).nseconds() as i64
+                            } else {
+                                -((buffer_pts - utc_time_pts).nseconds() as i64)
+                            };
+                            let buffer_utc_time = if buffer_pts_diff >= 0 {
+                                utc_time
+                                    .checked_sub(gst::ClockTime::from_nseconds(
+                                        buffer_pts_diff as u64,
+                                    ))
+                                    .unwrap()
+                            } else {
+                                utc_time
+                                    .checked_add(gst::ClockTime::from_nseconds(
+                                        (-buffer_pts_diff) as u64,
+                                    ))
+                                    .unwrap()
+                            };
+
+                            let buffer = buffer.buffer.make_mut();
+                            gst::ReferenceTimestampMeta::add(
+                                buffer,
+                                &UNIX_CAPS,
+                                buffer_utc_time,
+                                gst::ClockTime::NONE,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Calculate the minimum across all streams and remember that
+            if state.start_utc_time.is_none() {
+                let mut start_utc_time = None;
+
+                for (idx, drain_buffers) in drain_buffers.iter().enumerate() {
+                    for buffer in drain_buffers {
+                        let utc_time = match buffer
+                            .buffer
+                            .iter_meta::<gst::ReferenceTimestampMeta>()
+                            .find_map(|meta| {
+                                if meta.reference().can_intersect(&UNIX_CAPS) {
+                                    Some(
+                                        meta.timestamp()
+                                            + gst::ClockTime::from_seconds(MP4_UNIX_OFFSET),
+                                    )
+                                } else if meta.reference().can_intersect(&NTP_CAPS) {
+                                    meta.timestamp()
+                                        .checked_sub(gst::ClockTime::from_seconds(NTP_MP4_OFFSET))
+                                } else {
+                                    None
+                                }
+                            }) {
+                            None => {
+                                gst::error!(
+                                    CAT,
+                                    obj: &state.streams[idx].sinkpad,
+                                    "No reference timestamp set on all buffers"
+                                );
+                                return Err(gst::FlowError::Error);
+                            }
+                            Some(utc_time) => utc_time,
+                        };
+
+                        if start_utc_time.is_none() || start_utc_time > Some(utc_time) {
+                            start_utc_time = Some(utc_time);
+                        }
+                    }
+                }
+
+                gst::debug!(
+                    CAT,
+                    obj: element,
+                    "Configuring start UTC time {}",
+                    start_utc_time.unwrap()
+                );
+                state.start_utc_time = start_utc_time;
+            }
+
+            // Update all buffer timestamps based on the UTC time and offset to the start UTC time
+            let start_utc_time = state.start_utc_time.unwrap();
+            for (idx, drain_buffers) in drain_buffers.iter_mut().enumerate() {
+                let mut start_time = None;
+
+                for buffer in drain_buffers.iter_mut() {
+                    let utc_time = match buffer
+                        .buffer
+                        .iter_meta::<gst::ReferenceTimestampMeta>()
+                        .find_map(|meta| {
+                            if meta.reference().can_intersect(&UNIX_CAPS) {
+                                Some(
+                                    meta.timestamp()
+                                        + gst::ClockTime::from_seconds(MP4_UNIX_OFFSET),
+                                )
+                            } else if meta.reference().can_intersect(&NTP_CAPS) {
+                                meta.timestamp()
+                                    .checked_sub(gst::ClockTime::from_seconds(NTP_MP4_OFFSET))
+                            } else {
+                                None
+                            }
+                        }) {
+                        None => {
+                            gst::error!(
+                                CAT,
+                                obj: &state.streams[idx].sinkpad,
+                                "No reference timestamp set on all buffers"
+                            );
+                            return Err(gst::FlowError::Error);
+                        }
+                        Some(utc_time) => utc_time,
+                    };
+
+                    // Convert PTS UTC time to DTS
+                    let utc_time_dts =
+                        if let Some(composition_time_offset) = buffer.composition_time_offset {
+                            if composition_time_offset >= 0 {
+                                utc_time
+                                    .checked_sub(gst::ClockTime::from_nseconds(
+                                        composition_time_offset as u64,
+                                    ))
+                                    .unwrap()
+                            } else {
+                                utc_time
+                                    .checked_add(gst::ClockTime::from_nseconds(
+                                        (-composition_time_offset) as u64,
+                                    ))
+                                    .unwrap()
+                            }
+                        } else {
+                            utc_time
+                        };
+
+                    buffer.timestamp = utc_time_dts.checked_sub(start_utc_time).unwrap();
+                    if start_time.is_none() || start_time > Some(buffer.timestamp) {
+                        start_time = Some(buffer.timestamp);
+                    }
+                }
+
+                // Update durations for all buffers except for the last in the fragment unless all
+                // have the same duration anyway
+                let mut common_duration = Ok(None);
+                let mut drain_buffers_iter = drain_buffers.iter_mut().peekable();
+                while let Some(buffer) = drain_buffers_iter.next() {
+                    let next_timestamp = drain_buffers_iter.peek().map(|b| b.timestamp);
+
+                    if let Some(next_timestamp) = next_timestamp {
+                        let duration = next_timestamp.saturating_sub(buffer.timestamp);
+                        if common_duration == Ok(None) {
+                            common_duration = Ok(Some(duration));
+                        } else if common_duration != Ok(Some(duration)) {
+                            common_duration = Err(());
+                        }
+
+                        buffer.duration = duration;
+                    } else {
+                        if let Ok(Some(common_duration)) = common_duration {
+                            buffer.duration = common_duration;
+                        }
+                    }
+
+                    let end_utc_time = start_utc_time + buffer.timestamp + buffer.duration;
+                    if max_end_utc_time.is_none() || max_end_utc_time < Some(end_utc_time) {
+                        max_end_utc_time = Some(end_utc_time);
+                    }
+                }
+
+                streams[idx].2.as_mut().unwrap().start_time = start_time.unwrap();
+            }
+        }
+
         // Create header now if it was not created before and return the caps
         let mut caps = None;
         if state.stream_header.is_none() {
@@ -874,6 +1123,7 @@ impl FMP4Mux {
                 });
             }
             state.end_pts = Some(max_end_pts);
+            state.end_utc_time = max_end_utc_time;
 
             // Update for the start PTS of the next fragment
             state.fragment_start_pts = state
@@ -1020,11 +1270,19 @@ impl FMP4Mux {
 
         assert!(!at_eos || state.streams.iter().all(|s| s.queued_gops.is_empty()));
 
-        let duration = state
-            .end_pts
-            .opt_checked_sub(state.earliest_pts)
-            .ok()
-            .flatten();
+        let duration = if variant == super::Variant::ONVIF {
+            state
+                .end_utc_time
+                .opt_checked_sub(state.start_utc_time)
+                .ok()
+                .flatten()
+        } else {
+            state
+                .end_pts
+                .opt_checked_sub(state.earliest_pts)
+                .ok()
+                .flatten()
+        };
 
         let streams = state
             .streams
@@ -1039,6 +1297,7 @@ impl FMP4Mux {
             streams: streams.as_slice(),
             write_mehd: settings.write_mehd,
             duration: if at_eos { duration } else { None },
+            start_utc_time: state.start_utc_time,
         })
         .map_err(|err| {
             gst::error!(CAT, obj: element, "Failed to create FMP4 header: {}", err);
@@ -2246,6 +2505,7 @@ impl ElementImpl for ONVIFFMP4Mux {
                         .build(),
                     gst::Structure::builder("application/x-onvif-metadata")
                         .field("encoding", "utf8")
+                        .field("parsed", true)
                         .build(),
                 ]
                 .into_iter()

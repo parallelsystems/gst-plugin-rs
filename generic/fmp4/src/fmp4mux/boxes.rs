@@ -448,12 +448,16 @@ fn write_moov(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), E
                 // Successor Fragment UUID
                 v.extend(settings.successor_uuid.as_bytes());
 
-                // FIXME: Get these somehow
                 // UTC start time
-                v.extend(0u64.to_be_bytes());
+                v.extend(cfg.start_utc_time.unwrap().seconds().to_be_bytes());
 
                 // UTC duration
-                v.extend(0u64.to_be_bytes());
+                v.extend(
+                    cfg.duration
+                        .unwrap_or(gst::ClockTime::ZERO)
+                        .seconds()
+                        .to_be_bytes(),
+                );
 
                 // predecessor URI size
                 v.extend(
