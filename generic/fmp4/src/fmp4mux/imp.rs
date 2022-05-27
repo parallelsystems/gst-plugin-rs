@@ -61,6 +61,12 @@ impl Default for Settings {
     }
 }
 
+struct GopBuffer {
+    buffer: gst::Buffer,
+    pts: gst::ClockTime,
+    dts: Option<gst::ClockTime>,
+}
+
 struct Gop {
     // Running times
     start_pts: gst::ClockTime,
@@ -80,7 +86,7 @@ struct Gop {
     start_dts_position: Option<gst::ClockTime>,
 
     // Buffer, PTS running time, DTS running time
-    buffers: Vec<Buffer>,
+    buffers: Vec<GopBuffer>,
 }
 
 struct Stream {
@@ -129,10 +135,11 @@ pub(crate) struct FMP4Mux {
 }
 
 impl FMP4Mux {
-    fn queue_input(
+    // Queue incoming buffers as individual GOPs.
+    fn queue_gops(
         &self,
         element: &super::FMP4Mux,
-        idx: usize,
+        _idx: usize,
         stream: &mut Stream,
         segment: &gst::FormattedSegment<gst::ClockTime>,
         mut buffer: gst::Buffer,
@@ -296,12 +303,7 @@ impl FMP4Mux {
                 end_pts,
                 end_dts,
                 final_end_pts: false,
-                buffers: vec![Buffer {
-                    idx,
-                    buffer,
-                    pts,
-                    dts,
-                }],
+                buffers: vec![GopBuffer { buffer, pts, dts }],
             };
             stream.queued_gops.push_front(gop);
 
@@ -348,8 +350,7 @@ impl FMP4Mux {
 
             gop.end_pts = std::cmp::max(gop.end_pts, end_pts);
             gop.end_dts = Some(std::cmp::max(gop.end_dts.expect("no end DTS"), end_dts));
-            gop.buffers.push(Buffer {
-                idx,
+            gop.buffers.push(GopBuffer {
                 buffer,
                 pts,
                 dts: Some(dts),
@@ -525,7 +526,7 @@ impl FMP4Mux {
         let mut min_start_dts_position = None;
         let mut max_end_pts = None;
 
-        for stream in &mut state.streams {
+        for (idx, stream) in state.streams.iter_mut().enumerate() {
             assert!(
                 timeout
                     || at_eos
@@ -566,7 +567,6 @@ impl FMP4Mux {
                 let start_dts = first_gop.start_dts;
                 let start_dts_position = first_gop.start_dts_position;
                 let end_pts = last_gop.end_pts;
-                let end_dts = last_gop.end_dts;
                 let dts_offset = stream.dts_offset;
 
                 if min_earliest_pts.map_or(true, |min| min > earliest_pts) {
@@ -615,31 +615,93 @@ impl FMP4Mux {
                         .unwrap_or(gst::ClockTime::ZERO)
                 );
 
+                let start_time = if stream.intra_only {
+                    earliest_pts
+                } else {
+                    start_dts.unwrap()
+                };
+
                 streams.push((
                     &stream.sinkpad,
                     &stream.caps,
                     Some(super::FragmentTimingInfo {
-                        earliest_pts,
-                        start_dts,
-                        end_pts,
-                        end_dts,
-                        dts_offset,
+                        start_time,
+                        intra_only: stream.intra_only,
                     }),
                 ));
-            }
-            let mut buffers = VecDeque::with_capacity(gops.iter().map(|g| g.buffers.len()).sum());
-            for gop in gops {
-                for buffer in gop.buffers {
-                    buffers.push_back(buffer);
+
+                let mut buffers =
+                    VecDeque::with_capacity(gops.iter().map(|g| g.buffers.len()).sum());
+
+                for gop in gops {
+                    let mut gop_buffers = gop.buffers.into_iter().peekable();
+                    while let Some(buffer) = gop_buffers.next() {
+                        let timestamp = if stream.intra_only {
+                            buffer.pts
+                        } else {
+                            buffer.dts.unwrap()
+                        };
+
+                        let end_timestamp = match gop_buffers.peek() {
+                            Some(ref buffer) => {
+                                if stream.intra_only {
+                                    buffer.pts
+                                } else {
+                                    buffer.dts.unwrap()
+                                }
+                            }
+                            None => {
+                                if stream.intra_only {
+                                    gop.end_pts
+                                } else {
+                                    gop.end_dts.unwrap()
+                                }
+                            }
+                        };
+
+                        let duration = end_timestamp.saturating_sub(timestamp);
+
+                        let composition_time_offset = if stream.intra_only {
+                            None
+                        } else {
+                            let pts = buffer.pts;
+                            let dts = buffer.dts.unwrap();
+
+                            if pts > dts {
+                                Some(
+                                    i64::try_from((pts - dts).nseconds())
+                                        .map_err(|_| {
+                                            gst::error!(CAT, obj: &stream.sinkpad, "Too big PTS/DTS difference");
+                                            gst::FlowError::Error
+                                        })?,
+                                )
+                            } else {
+                                let diff = i64::try_from((dts - pts).nseconds())
+                                    .map_err(|_| {
+                                        gst::error!(CAT, obj: &stream.sinkpad, "Too big PTS/DTS difference");
+                                        gst::FlowError::Error
+                                    })?;
+                                Some(-diff)
+                            }
+                        };
+
+                        buffers.push_back(Buffer {
+                            idx,
+                            buffer: buffer.buffer,
+                            timestamp,
+                            duration,
+                            composition_time_offset,
+                        });
+                    }
                 }
+                drain_buffers.push(buffers);
             }
-            drain_buffers.push(buffers);
         }
 
         // Interleave buffers according to the settings into a single vec
         let mut interleaved_buffers =
             Vec::with_capacity(drain_buffers.iter().map(|bs| bs.len()).sum());
-        while let Some((idx, bs)) =
+        while let Some((_idx, bs)) =
             drain_buffers
                 .iter_mut()
                 .enumerate()
@@ -651,7 +713,7 @@ impl FMP4Mux {
                         (Some(a), Some(b)) => (a, b),
                     };
 
-                    match a.dts.unwrap_or(a.pts).cmp(&b.dts.unwrap_or(b.pts)) {
+                    match a.timestamp.cmp(&b.timestamp) {
                         std::cmp::Ordering::Equal => a_idx.cmp(b_idx),
                         cmp => cmp,
                     }
@@ -662,7 +724,7 @@ impl FMP4Mux {
                     // No more buffers now
                     break;
                 }
-                Some(buf) => buf.dts.unwrap_or(buf.pts),
+                Some(buf) => buf.timestamp,
             };
             let mut current_end_time = start_time;
             let mut dequeued_bytes = 0;
@@ -675,13 +737,7 @@ impl FMP4Mux {
                 })
             {
                 if let Some(buffer) = bs.pop_front() {
-                    current_end_time = match bs.front() {
-                        Some(next_buffer) => next_buffer.dts.unwrap_or(next_buffer.pts),
-                        None => {
-                            let timing_info = streams[idx].2.as_ref().unwrap();
-                            timing_info.end_dts.unwrap_or(timing_info.end_pts)
-                        }
-                    };
+                    current_end_time = buffer.timestamp + buffer.duration;
                     dequeued_bytes += buffer.buffer.size() as u64;
                     interleaved_buffers.push(buffer);
                 } else {
@@ -804,7 +860,7 @@ impl FMP4Mux {
             // in this segment then don't write anything.
             if let Some((_pad, _caps, Some(ref timing_info))) = streams.get(0) {
                 state.fragment_offsets.push(super::FragmentOffset {
-                    time: timing_info.earliest_pts,
+                    time: timing_info.start_time,
                     offset: moof_offset,
                 });
             }
@@ -1408,10 +1464,13 @@ impl AggregatorImpl for FMP4Mux {
         let buffers = {
             let mut state = self.state.lock().unwrap();
 
-            // Create streams, stream header in the beginning and set output caps.
-            if state.stream_header.is_none() {
+            // Create streams
+            if state.streams.is_empty() {
                 self.create_streams(aggregator, &mut state)?;
+            }
 
+            // Stream header in the beginning and set output caps.
+            if state.stream_header.is_none() {
                 let (_, caps) = self
                     .update_header(aggregator, &mut state, &settings, false)?
                     .unwrap();
@@ -1456,7 +1515,7 @@ impl AggregatorImpl for FMP4Mux {
                 let pts = buffer.pts();
 
                 // Queue up the buffer and update GOP tracking state
-                self.queue_input(aggregator, idx, stream, &segment, buffer)?;
+                self.queue_gops(aggregator, idx, stream, &segment, buffer)?;
 
                 // If we have a PTS with this buffer, check if a new force-keyunit event for the next
                 // fragment start has to be created

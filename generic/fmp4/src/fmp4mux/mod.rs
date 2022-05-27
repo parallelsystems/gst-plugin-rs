@@ -66,16 +66,6 @@ pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Buffer {
-    /// Track index
-    idx: usize,
-    buffer: gst::Buffer,
-    // Running times
-    pts: gst::ClockTime,
-    dts: Option<gst::ClockTime>,
-}
-
-#[derive(Debug)]
 pub(crate) struct HeaderConfiguration<'a> {
     variant: Variant,
     element: &'a FMP4Mux,
@@ -88,16 +78,6 @@ pub(crate) struct HeaderConfiguration<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) struct FragmentTimingInfo {
-    earliest_pts: gst::ClockTime,
-    start_dts: Option<gst::ClockTime>,
-    end_pts: gst::ClockTime,
-    end_dts: Option<gst::ClockTime>,
-    #[allow(dead_code)]
-    dts_offset: Option<gst::ClockTime>,
-}
-
-#[derive(Debug)]
 pub(crate) struct FragmentHeaderConfiguration<'a> {
     variant: Variant,
     sequence_number: u32,
@@ -107,6 +87,32 @@ pub(crate) struct FragmentHeaderConfiguration<'a> {
         Option<FragmentTimingInfo>,
     )],
     buffers: &'a [Buffer],
+}
+
+#[derive(Debug)]
+pub(crate) struct FragmentTimingInfo {
+    /// Start time of this fragment
+    start_time: gst::ClockTime,
+    /// Set if this is an intra-only stream
+    intra_only: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct Buffer {
+    /// Track index
+    idx: usize,
+
+    /// Actual buffer
+    buffer: gst::Buffer,
+
+    /// Timestamp
+    timestamp: gst::ClockTime,
+
+    /// Sample duration
+    duration: gst::ClockTime,
+
+    /// Composition time offset
+    composition_time_offset: Option<i64>,
 }
 
 #[allow(clippy::upper_case_acronyms)]

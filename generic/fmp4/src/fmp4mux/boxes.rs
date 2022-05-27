@@ -1627,8 +1627,11 @@ fn write_mfhd(v: &mut Vec<u8>, cfg: &super::FragmentHeaderConfiguration) -> Resu
 }
 
 #[allow(clippy::identity_op)]
-fn sample_flags_from_buffer(buffer: &gst::BufferRef, intra_only: bool) -> u32 {
-    if intra_only {
+fn sample_flags_from_buffer(
+    timing_info: &super::FragmentTimingInfo,
+    buffer: &gst::BufferRef,
+) -> u32 {
+    if timing_info.intra_only {
         (0b00u32 << (16 + 10)) | // leading: unknown
         (0b10u32 << (16 + 8)) | // depends: no
         (0b10u32 << (16 + 6)) | // depended: no
@@ -1663,47 +1666,6 @@ fn sample_flags_from_buffer(buffer: &gst::BufferRef, intra_only: bool) -> u32 {
     }
 }
 
-fn composition_time_offset_from_pts_dts(
-    pts: gst::ClockTime,
-    dts: Option<gst::ClockTime>,
-    timescale: u32,
-) -> Result<i32, Error> {
-    let (_, pts, dts) = timestamp_from_pts_dts(pts, dts, true, timescale)?;
-    let dts = dts.expect("no DTS");
-
-    let diff = if pts > dts {
-        i32::try_from((pts - dts) as i64).context("pts-dts diff too big")?
-    } else {
-        let diff = dts - pts;
-        i32::try_from(-(diff as i64)).context("pts-dts diff too big")?
-    };
-
-    Ok(diff)
-}
-
-fn timestamp_from_pts_dts(
-    pts: gst::ClockTime,
-    dts: Option<gst::ClockTime>,
-    check_dts: bool,
-    timescale: u32,
-) -> Result<(u64, u64, Option<u64>), Error> {
-    let pts = pts
-        .nseconds()
-        .mul_div_round(timescale as u64, gst::ClockTime::SECOND.nseconds())
-        .context("too big PTS")?;
-
-    if check_dts {
-        let dts = dts.expect("no DTS");
-        let dts = dts
-            .nseconds()
-            .mul_div_round(timescale as u64, gst::ClockTime::SECOND.nseconds())
-            .context("too big DTS")?;
-        Ok((dts, pts, Some(dts)))
-    } else {
-        Ok((pts, pts, None))
-    }
-}
-
 const DEFAULT_SAMPLE_DURATION_PRESENT: u32 = 0x08;
 const DEFAULT_SAMPLE_SIZE_PRESENT: u32 = 0x10;
 const DEFAULT_SAMPLE_FLAGS_PRESENT: u32 = 0x20;
@@ -1721,8 +1683,6 @@ fn analyze_buffers(
     cfg: &super::FragmentHeaderConfiguration,
     idx: usize,
     timing_info: &super::FragmentTimingInfo,
-    check_dts: bool,
-    intra_only: bool,
     timescale: u32,
 ) -> Result<
     (
@@ -1744,7 +1704,6 @@ fn analyze_buffers(
     let mut tf_flags = DEFAULT_BASE_IS_MOOF;
     let mut tr_flags = DATA_OFFSET_PRESENT;
 
-    let mut last_timestamp = None;
     let mut duration = None;
     let mut size = None;
     let mut first_buffer_flags = None;
@@ -1755,8 +1714,9 @@ fn analyze_buffers(
     for Buffer {
         idx: _idx,
         buffer,
-        pts,
-        dts,
+        timestamp: _timestamp,
+        duration: sample_duration,
+        composition_time_offset,
     } in cfg.buffers.iter().filter(|b| b.idx == idx)
     {
         if size.is_none() {
@@ -1766,27 +1726,22 @@ fn analyze_buffers(
             tr_flags |= SAMPLE_SIZE_PRESENT;
         }
 
-        {
-            let (current_timestamp, _pts, _dts) =
-                timestamp_from_pts_dts(*pts, *dts, check_dts, timescale)?;
+        let sample_duration = u32::try_from(
+            sample_duration
+                .nseconds()
+                .mul_div_round(timescale as u64, gst::ClockTime::SECOND.nseconds())
+                .context("too big sample duration")?,
+        )
+        .context("too big sample duration")?;
 
-            if let Some(prev_timestamp) = last_timestamp {
-                let dur = u32::try_from(current_timestamp.saturating_sub(prev_timestamp))
-                    .context("too big sample duration")?;
-                last_timestamp = Some(current_timestamp);
-
-                if duration.is_none() {
-                    duration = Some(dur);
-                }
-                if Some(dur) != duration {
-                    tr_flags |= SAMPLE_DURATION_PRESENT;
-                }
-            } else {
-                last_timestamp = Some(current_timestamp);
-            }
+        if duration.is_none() {
+            duration = Some(sample_duration);
+        }
+        if Some(sample_duration) != duration {
+            tr_flags |= SAMPLE_DURATION_PRESENT;
         }
 
-        let f = sample_flags_from_buffer(buffer, intra_only);
+        let f = sample_flags_from_buffer(timing_info, buffer);
         if first_buffer_flags.is_none() {
             first_buffer_flags = Some(f);
         } else {
@@ -1801,38 +1756,13 @@ fn analyze_buffers(
             tr_flags |= SAMPLE_FLAGS_PRESENT;
         }
 
-        if check_dts {
-            let diff = composition_time_offset_from_pts_dts(*pts, *dts, timescale)?;
-            if diff != 0 {
+        if let Some(composition_time_offset) = *composition_time_offset {
+            assert!(!timing_info.intra_only);
+            if composition_time_offset != 0 {
                 tr_flags |= SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT;
             }
-            if diff < 0 {
+            if composition_time_offset < 0 {
                 negative_composition_time_offsets = true;
-            }
-        }
-    }
-
-    // Check duration of the last buffer against end_pts / end_dts
-    {
-        let current_timestamp = if check_dts {
-            timing_info.end_dts.expect("no end DTS")
-        } else {
-            timing_info.end_pts
-        };
-        let current_timestamp = current_timestamp
-            .nseconds()
-            .mul_div_round(timescale as u64, gst::ClockTime::SECOND.nseconds())
-            .context("too big timestamp")?;
-
-        if let Some(prev_timestamp) = last_timestamp {
-            let dur = u32::try_from(current_timestamp.saturating_sub(prev_timestamp))
-                .context("too big sample duration")?;
-
-            if duration.is_none() {
-                duration = Some(dur);
-            }
-            if Some(dur) != duration {
-                tr_flags |= SAMPLE_DURATION_PRESENT;
             }
         }
     }
@@ -1881,19 +1811,7 @@ fn write_traf(
     caps: &gst::CapsRef,
     timing_info: &super::FragmentTimingInfo,
 ) -> Result<(), Error> {
-    let s = caps.structure(0).unwrap();
     let timescale = caps_to_timescale(caps);
-
-    let check_dts = matches!(s.name(), "video/x-h264" | "video/x-h265");
-    let intra_only = matches!(
-        s.name(),
-        "audio/mpeg"
-            | "audio/x-alaw"
-            | "audio/x-mulaw"
-            | "audio/x-adpcm"
-            | "image/jpeg"
-            | "application/x-onvif-metadata"
-    );
 
     // Analyze all buffers to know what values can be put into the tfhd for all samples and what
     // has to be stored for every single sample
@@ -1904,7 +1822,7 @@ fn write_traf(
         default_duration,
         default_flags,
         negative_composition_time_offsets,
-    ) = analyze_buffers(cfg, idx, timing_info, check_dts, intra_only, timescale)?;
+    ) = analyze_buffers(cfg, idx, timing_info, timescale)?;
 
     assert!((tf_flags & DEFAULT_SAMPLE_SIZE_PRESENT == 0) ^ default_size.is_some());
     assert!((tf_flags & DEFAULT_SAMPLE_DURATION_PRESENT == 0) ^ default_duration.is_some());
@@ -1929,23 +1847,6 @@ fn write_traf(
             continue;
         }
 
-        let last_end_timestamp =
-            if let Some(Buffer { pts, dts, .. }) = iter.as_slice().iter().find(|b| b.idx == idx) {
-                timestamp_from_pts_dts(*pts, *dts, check_dts, timescale)
-                    .map(|(current_timestamp, _pts, _dts)| current_timestamp)?
-            } else {
-                let last_end_timestamp = if check_dts {
-                    timing_info.end_dts.expect("no end DTS")
-                } else {
-                    timing_info.end_pts
-                };
-
-                last_end_timestamp
-                    .nseconds()
-                    .mul_div_round(timescale as u64, gst::ClockTime::SECOND.nseconds())
-                    .context("too big timestamp")?
-            };
-
         let data_offset_offset = write_full_box(
             v,
             b"trun",
@@ -1961,11 +1862,9 @@ fn write_traf(
                     cfg,
                     current_data_offset,
                     tr_flags,
-                    check_dts,
-                    intra_only,
                     timescale,
+                    timing_info,
                     run,
-                    last_end_timestamp,
                 )
             },
         )?;
@@ -2018,8 +1917,7 @@ fn write_tfdt(
     timescale: u32,
 ) -> Result<(), Error> {
     let base_time = timing_info
-        .start_dts
-        .unwrap_or(timing_info.earliest_pts)
+        .start_time
         .mul_div_floor(timescale as u64, gst::ClockTime::SECOND.nseconds())
         .context("base time overflow")?;
 
@@ -2034,11 +1932,9 @@ fn write_trun(
     _cfg: &super::FragmentHeaderConfiguration,
     current_data_offset: u32,
     tr_flags: u32,
-    check_dts: bool,
-    intra_only: bool,
     timescale: u32,
+    timing_info: &super::FragmentTimingInfo,
     buffers: &[Buffer],
-    last_end_timestamp: u64,
 ) -> Result<usize, Error> {
     // Sample count
     v.extend((buffers.len() as u32).to_be_bytes());
@@ -2048,37 +1944,27 @@ fn write_trun(
     v.extend(current_data_offset.to_be_bytes());
 
     if (tr_flags & FIRST_SAMPLE_FLAGS_PRESENT) != 0 {
-        v.extend(sample_flags_from_buffer(&buffers[0].buffer, intra_only).to_be_bytes());
+        v.extend(sample_flags_from_buffer(timing_info, &buffers[0].buffer).to_be_bytes());
     }
 
-    for (
-        Buffer {
-            idx: _idx,
-            buffer,
-            pts,
-            dts,
-        },
-        next_timestamp,
-    ) in Iterator::zip(
-        buffers.iter(),
-        buffers
-            .iter()
-            .skip(1)
-            .map(|Buffer { pts, dts, .. }| {
-                timestamp_from_pts_dts(*pts, *dts, check_dts, timescale)
-                    .map(|(current_timestamp, _pts, _dts)| current_timestamp)
-            })
-            .chain(Some(Ok(last_end_timestamp))),
-    ) {
-        let next_timestamp = next_timestamp?;
-
+    for Buffer {
+        idx: _idx,
+        ref buffer,
+        timestamp: _timestamp,
+        duration,
+        composition_time_offset,
+    } in buffers.iter()
+    {
         if (tr_flags & SAMPLE_DURATION_PRESENT) != 0 {
             // Sample duration
-            let (current_timestamp, _pts, _dts) =
-                timestamp_from_pts_dts(*pts, *dts, check_dts, timescale)?;
-            let dur = u32::try_from(next_timestamp.saturating_sub(current_timestamp))
-                .context("too big sample duration")?;
-            v.extend(dur.to_be_bytes());
+            let sample_duration = u32::try_from(
+                duration
+                    .nseconds()
+                    .mul_div_round(timescale as u64, gst::ClockTime::SECOND.nseconds())
+                    .context("too big sample duration")?,
+            )
+            .context("too big sample duration")?;
+            v.extend(sample_duration.to_be_bytes());
         }
 
         if (tr_flags & SAMPLE_SIZE_PRESENT) != 0 {
@@ -2090,12 +1976,19 @@ fn write_trun(
             assert!((tr_flags & FIRST_SAMPLE_FLAGS_PRESENT) == 0);
 
             // Sample flags
-            v.extend(sample_flags_from_buffer(buffer, intra_only).to_be_bytes());
+            v.extend(sample_flags_from_buffer(timing_info, buffer).to_be_bytes());
         }
 
         if (tr_flags & SAMPLE_COMPOSITION_TIME_OFFSET_PRESENT) != 0 {
             // Sample composition time offset
-            v.extend(composition_time_offset_from_pts_dts(*pts, *dts, timescale)?.to_be_bytes());
+            let composition_time_offset = i32::try_from(
+                composition_time_offset
+                    .unwrap_or(0)
+                    .mul_div_round(timescale as i64, gst::ClockTime::SECOND.nseconds() as i64)
+                    .context("too big composition time offset")?,
+            )
+            .context("too big composition time offset")?;
+            v.extend(composition_time_offset.to_be_bytes());
         }
     }
 
@@ -2177,10 +2070,6 @@ struct GroupBy<'a, T: 'a, P> {
 impl<'a, T: 'a, P> GroupBy<'a, T, P> {
     fn new(slice: &'a [T], predicate: P) -> Self {
         GroupBy { slice, predicate }
-    }
-
-    fn as_slice(&'a self) -> &'a [T] {
-        self.slice
     }
 }
 
