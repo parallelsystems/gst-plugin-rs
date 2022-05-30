@@ -666,7 +666,7 @@ impl FMP4Mux {
                         };
 
                         let end_timestamp = match gop_buffers.peek() {
-                            Some(ref buffer) => {
+                            Some(buffer) => {
                                 if stream.intra_only {
                                     buffer.pts
                                 } else {
@@ -931,10 +931,8 @@ impl FMP4Mux {
                         }
 
                         buffer.duration = duration;
-                    } else {
-                        if let Ok(Some(common_duration)) = common_duration {
-                            buffer.duration = common_duration;
-                        }
+                    } else if let Ok(Some(common_duration)) = common_duration {
+                        buffer.duration = common_duration;
                     }
 
                     let end_utc_time = start_utc_time + buffer.timestamp + buffer.duration;
@@ -951,7 +949,7 @@ impl FMP4Mux {
         let mut caps = None;
         if state.stream_header.is_none() {
             let (_, new_caps) = self
-                .update_header(element, state, &settings, false)?
+                .update_header(element, state, settings, false)?
                 .unwrap();
             caps = Some(new_caps);
         }
