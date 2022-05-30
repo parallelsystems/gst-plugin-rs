@@ -373,6 +373,92 @@ pub(super) fn create_fmp4_header(cfg: super::HeaderConfiguration) -> Result<gst:
 
     write_box(&mut v, b"moov", |v| write_moov(v, &cfg))?;
 
+    if cfg.variant == super::Variant::ONVIF {
+        write_full_box(
+            &mut v,
+            b"meta",
+            FULL_BOX_VERSION_0,
+            FULL_BOX_FLAGS_NONE,
+            |v| {
+                write_full_box(v, b"hdlr", FULL_BOX_VERSION_0, FULL_BOX_FLAGS_NONE, |v| {
+                    // Handler type
+                    v.extend(b"null");
+
+                    // Reserved
+                    v.extend([0u8; 3 * 4]);
+
+                    // Name
+                    v.extend(b"MetadataHandler");
+
+                    Ok(())
+                })?;
+
+                write_box(v, b"sumi", |v| {
+                    let settings = cfg
+                        .element
+                        .downcast_ref::<super::ONVIFFMP4Mux>()
+                        .unwrap()
+                        .imp()
+                        .settings
+                        .lock()
+                        .unwrap();
+
+                    // Fragment UUID
+                    v.extend(settings.fragment_uuid.as_bytes());
+
+                    // Predecessor Fragment UUID
+                    v.extend(settings.predecessor_uuid.as_bytes());
+
+                    // Successor Fragment UUID
+                    v.extend(settings.successor_uuid.as_bytes());
+
+                    // UTC start time
+                    v.extend(cfg.start_utc_time.unwrap().seconds().to_be_bytes());
+
+                    // UTC duration
+                    v.extend(
+                        cfg.duration
+                            .unwrap_or(gst::ClockTime::ZERO)
+                            .seconds()
+                            .to_be_bytes(),
+                    );
+
+                    // predecessor URI size
+                    v.extend(
+                        (settings
+                            .predecessor_uri
+                            .as_ref()
+                            .map(|s| s.len() + 1)
+                            .unwrap_or(0) as u16)
+                            .to_be_bytes(),
+                    );
+
+                    // successor URI size
+                    v.extend(
+                        (settings
+                            .successor_uri
+                            .as_ref()
+                            .map(|s| s.len() + 1)
+                            .unwrap_or(0) as u16)
+                            .to_be_bytes(),
+                    );
+
+                    if let Some(ref predecessor_uri) = settings.predecessor_uri {
+                        v.extend(predecessor_uri.as_bytes());
+                        v.push(0);
+                    }
+
+                    if let Some(ref successor_uri) = settings.successor_uri {
+                        v.extend(successor_uri.as_bytes());
+                        v.push(0);
+                    }
+
+                    Ok(())
+                })
+            },
+        )?;
+    }
+
     Ok(gst::Buffer::from_mut_slice(v))
 }
 
@@ -413,86 +499,6 @@ fn write_moov(v: &mut Vec<u8>, cfg: &super::HeaderConfiguration) -> Result<(), E
         })?;
     }
     write_box(v, b"mvex", |v| write_mvex(v, cfg))?;
-
-    if cfg.variant == super::Variant::ONVIF {
-        write_full_box(v, b"meta", FULL_BOX_VERSION_0, FULL_BOX_FLAGS_NONE, |v| {
-            write_full_box(v, b"hdlr", FULL_BOX_VERSION_0, FULL_BOX_FLAGS_NONE, |v| {
-                // Handler type
-                v.extend(b"null");
-
-                // Reserved
-                v.extend([0u8; 3 * 4]);
-
-                // Name
-                v.extend(b"MetadataHandler");
-
-                Ok(())
-            })?;
-
-            write_box(v, b"sumi", |v| {
-                let settings = cfg
-                    .element
-                    .downcast_ref::<super::ONVIFFMP4Mux>()
-                    .unwrap()
-                    .imp()
-                    .settings
-                    .lock()
-                    .unwrap();
-
-                // Fragment UUID
-                v.extend(settings.fragment_uuid.as_bytes());
-
-                // Predecessor Fragment UUID
-                v.extend(settings.predecessor_uuid.as_bytes());
-
-                // Successor Fragment UUID
-                v.extend(settings.successor_uuid.as_bytes());
-
-                // UTC start time
-                v.extend(cfg.start_utc_time.unwrap().seconds().to_be_bytes());
-
-                // UTC duration
-                v.extend(
-                    cfg.duration
-                        .unwrap_or(gst::ClockTime::ZERO)
-                        .seconds()
-                        .to_be_bytes(),
-                );
-
-                // predecessor URI size
-                v.extend(
-                    (settings
-                        .predecessor_uri
-                        .as_ref()
-                        .map(|s| s.len() + 1)
-                        .unwrap_or(0) as u16)
-                        .to_be_bytes(),
-                );
-
-                // successor URI size
-                v.extend(
-                    (settings
-                        .successor_uri
-                        .as_ref()
-                        .map(|s| s.len() + 1)
-                        .unwrap_or(0) as u16)
-                        .to_be_bytes(),
-                );
-
-                if let Some(ref predecessor_uri) = settings.predecessor_uri {
-                    v.extend(predecessor_uri.as_bytes());
-                    v.push(0);
-                }
-
-                if let Some(ref successor_uri) = settings.successor_uri {
-                    v.extend(successor_uri.as_bytes());
-                    v.push(0);
-                }
-
-                Ok(())
-            })
-        })?;
-    }
 
     Ok(())
 }
