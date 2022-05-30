@@ -394,6 +394,9 @@ pub(super) fn create_fmp4_header(cfg: super::HeaderConfiguration) -> Result<gst:
                 })?;
 
                 write_box(v, b"sumi", |v| {
+                    // Use the reference track timescale
+                    let timescale = caps_to_timescale(&cfg.streams[0].1);
+
                     let settings = cfg
                         .element
                         .downcast_ref::<super::ONVIFFMP4Mux>()
@@ -412,16 +415,26 @@ pub(super) fn create_fmp4_header(cfg: super::HeaderConfiguration) -> Result<gst:
                     // Successor Fragment UUID
                     v.extend(settings.successor_uuid.as_bytes());
 
+                    // FIXME: Using Jan 1 1904 as epoch here but this is not specified anywhere
+                    let start_utc_time = cfg
+                        .start_utc_time
+                        .expect("no start UTC time")
+                        .nseconds()
+                        .mul_div_floor(timescale as u64, gst::ClockTime::SECOND.nseconds())
+                        .context("too big start UTC time")?;
+
                     // UTC start time
-                    v.extend(cfg.start_utc_time.unwrap().seconds().to_be_bytes());
+                    v.extend(start_utc_time.to_be_bytes());
+
+                    let duration = cfg
+                        .duration
+                        .unwrap_or(gst::ClockTime::ZERO)
+                        .nseconds()
+                        .mul_div_ceil(timescale as u64, gst::ClockTime::SECOND.nseconds())
+                        .context("too long duration")?;
 
                     // UTC duration
-                    v.extend(
-                        cfg.duration
-                            .unwrap_or(gst::ClockTime::ZERO)
-                            .seconds()
-                            .to_be_bytes(),
-                    );
+                    v.extend(duration.to_be_bytes());
 
                     // predecessor URI size
                     v.extend(
