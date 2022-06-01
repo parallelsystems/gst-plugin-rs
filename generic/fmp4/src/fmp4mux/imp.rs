@@ -119,6 +119,14 @@ struct Stream {
     // Difference between the first DTS and 0 in case of negative DTS
     dts_offset: Option<gst::ClockTime>,
 
+    // Current position (DTS, or PTS for intra-only) to prevent
+    // timestamps from going backwards when queueing new buffers
+    current_position: gst::ClockTime,
+
+    // Current UTC time in ONVIF mode to prevent timestamps from
+    // going backwards when draining a fragment
+    current_utc_time: gst::ClockTime,
+
     last_force_keyunit_time: Option<gst::ClockTime>,
 }
 
@@ -190,7 +198,7 @@ impl FMP4Mux {
         let duration = buffer.duration();
         let end_pts_position = duration.map_or(pts_position, |duration| pts_position + duration);
 
-        let pts = match segment.to_running_time_full(pts_position) {
+        let mut pts = match segment.to_running_time_full(pts_position) {
             (_, None) => {
                 gst::error!(CAT, obj: &stream.sinkpad, "Couldn't convert PTS to running time");
                 return Err(gst::FlowError::Error);
@@ -202,7 +210,7 @@ impl FMP4Mux {
             (_, Some(pts)) => pts,
         };
 
-        let end_pts = match segment.to_running_time_full(end_pts_position) {
+        let mut end_pts = match segment.to_running_time_full(end_pts_position) {
             (_, None) => {
                 gst::error!(
                     CAT,
@@ -218,6 +226,23 @@ impl FMP4Mux {
             (_, Some(pts)) => pts,
         };
 
+        // Enforce monotonically increasing PTS for intra-only streams
+        if intra_only {
+            if pts < stream.current_position {
+                gst::warning!(
+                    CAT,
+                    obj: &stream.sinkpad,
+                    "Decreasing PTS {} < {} for intra-only stream",
+                    pts,
+                    stream.current_position,
+                );
+                pts = stream.current_position;
+            } else {
+                stream.current_position = pts;
+            }
+            end_pts = std::cmp::max(end_pts, pts);
+        }
+
         let (dts_position, dts, end_dts) = if intra_only {
             (None, None, None)
         } else {
@@ -227,7 +252,7 @@ impl FMP4Mux {
             let end_dts_position =
                 duration.map_or(dts_position, |duration| dts_position + duration);
 
-            let dts = match segment.to_running_time_full(dts_position) {
+            let mut dts = match segment.to_running_time_full(dts_position) {
                 (_, None) => {
                     gst::error!(CAT, obj: &stream.sinkpad, "Couldn't convert DTS to running time");
                     return Err(gst::FlowError::Error);
@@ -254,7 +279,7 @@ impl FMP4Mux {
                 }
             };
 
-            let end_dts = match segment.to_running_time_full(end_dts_position) {
+            let mut end_dts = match segment.to_running_time_full(end_dts_position) {
                 (_, None) => {
                     gst::error!(
                         CAT,
@@ -284,6 +309,24 @@ impl FMP4Mux {
                     }
                 }
             };
+
+            // Enforce monotonically increasing DTS for intra-only streams
+            // NOTE: PTS stays the same so this will cause a bigger PTS/DTS difference
+            // FIXME: Is this correct?
+            if dts < stream.current_position {
+                gst::warning!(
+                    CAT,
+                    obj: &stream.sinkpad,
+                    "Decreasing DTS {} < {}",
+                    dts,
+                    stream.current_position,
+                );
+                dts = stream.current_position;
+            } else {
+                stream.current_position = dts;
+            }
+            end_dts = std::cmp::max(end_dts, dts);
+
             (Some(dts_position), Some(dts), Some(end_dts))
         };
 
@@ -339,8 +382,9 @@ impl FMP4Mux {
                     pts,
                     dts.display(),
                 );
-                prev_gop.end_pts = pts;
-                prev_gop.end_dts = dts;
+
+                prev_gop.end_pts = std::cmp::max(prev_gop.end_pts, pts);
+                prev_gop.end_dts = std::cmp::max(prev_gop.end_dts, dts);
 
                 if intra_only {
                     prev_gop.final_end_pts = true;
@@ -391,15 +435,17 @@ impl FMP4Mux {
                 gop.earliest_pts_position = pts_position;
 
                 if let Some(prev_gop) = stream.queued_gops.get_mut(1) {
-                    gst::debug!(
-                        CAT,
-                        obj: &stream.sinkpad,
-                        "Updating previous GOP starting PTS {} end time from {} to {}",
-                        pts,
-                        prev_gop.end_pts,
-                        pts
-                    );
-                    prev_gop.end_pts = pts;
+                    if prev_gop.end_pts < pts {
+                        gst::debug!(
+                            CAT,
+                            obj: &stream.sinkpad,
+                            "Updating previous GOP starting PTS {} end time from {} to {}",
+                            pts,
+                            prev_gop.end_pts,
+                            pts
+                        );
+                        prev_gop.end_pts = pts;
+                    }
                 }
             }
 
@@ -689,7 +735,10 @@ impl FMP4Mux {
                             }
                         };
 
-                        let duration = end_timestamp.saturating_sub(timestamp);
+                        // Timestamps are enforced to monotonically increase when queueing buffers
+                        let duration = end_timestamp
+                            .checked_sub(timestamp)
+                            .expect("Timestamps going backwards");
 
                         let composition_time_offset = if stream.intra_only {
                             None
@@ -897,7 +946,7 @@ impl FMP4Mux {
                     };
 
                     // Convert PTS UTC time to DTS
-                    let utc_time_dts =
+                    let mut utc_time_dts =
                         if let Some(composition_time_offset) = buffer.composition_time_offset {
                             if composition_time_offset >= 0 {
                                 utc_time
@@ -916,7 +965,33 @@ impl FMP4Mux {
                             utc_time
                         };
 
-                    buffer.timestamp = utc_time_dts.checked_sub(start_utc_time).unwrap();
+                    // Enforce monotonically increasing timestamps
+                    if utc_time_dts < state.streams[idx].current_utc_time {
+                        gst::warning!(
+                            CAT,
+                            obj: &state.streams[idx].sinkpad,
+                            "Decreasing UTC DTS timestamp for buffer {} < {}",
+                            utc_time_dts,
+                            state.streams[idx].current_utc_time,
+                        );
+                        utc_time_dts = state.streams[idx].current_utc_time;
+                    } else {
+                        state.streams[idx].current_utc_time = utc_time_dts;
+                    }
+
+                    let timestamp = utc_time_dts.checked_sub(start_utc_time).unwrap();
+
+                    gst::trace!(
+                        CAT,
+                        obj: &state.streams[idx].sinkpad,
+                        "Updating buffer timestamp from {} to relative UTC DTS time {} / absolute DTS time {}, UTC PTS time {}",
+                        buffer.timestamp,
+                        timestamp,
+                        utc_time_dts,
+                        utc_time,
+                    );
+
+                    buffer.timestamp = timestamp;
                     if start_time.is_none() || start_time > Some(buffer.timestamp) {
                         start_time = Some(buffer.timestamp);
                     }
@@ -937,9 +1012,35 @@ impl FMP4Mux {
                             common_duration = Err(());
                         }
 
+                        gst::trace!(
+                            CAT,
+                            obj: &state.streams[idx].sinkpad,
+                            "Updating buffer with timestamp {} duration from {} to relative UTC duration {}",
+                            buffer.timestamp,
+                            buffer.duration,
+                            duration,
+                        );
+
                         buffer.duration = duration;
                     } else if let Ok(Some(common_duration)) = common_duration {
+                        gst::trace!(
+                            CAT,
+                            obj: &state.streams[idx].sinkpad,
+                            "Updating last buffer with timestamp {} duration from {} to common relative UTC duration {}",
+                            buffer.timestamp,
+                            buffer.duration,
+                            common_duration,
+                        );
+
                         buffer.duration = common_duration;
+                    } else {
+                        gst::trace!(
+                            CAT,
+                            obj: &state.streams[idx].sinkpad,
+                            "Keeping last buffer with timestamp {} duration at {}",
+                            buffer.timestamp,
+                            buffer.duration,
+                        );
                     }
 
                     let end_utc_time = start_utc_time + buffer.timestamp + buffer.duration;
@@ -949,6 +1050,7 @@ impl FMP4Mux {
                 }
 
                 if let Some(start_time) = start_time {
+                    gst::debug!(CAT, obj: &streams[idx].0, "Fragment starting at UTC time {}", start_time);
                     streams[idx].2.as_mut().unwrap().start_time = start_time;
                 } else {
                     assert!(streams[idx].2.is_none());
@@ -1234,6 +1336,8 @@ impl FMP4Mux {
                 queued_gops: VecDeque::new(),
                 fragment_filled: false,
                 dts_offset: None,
+                current_position: gst::ClockTime::ZERO,
+                current_utc_time: gst::ClockTime::ZERO,
                 last_force_keyunit_time: None,
             });
         }
@@ -1693,6 +1797,8 @@ impl AggregatorImpl for FMP4Mux {
         for stream in &mut state.streams {
             stream.queued_gops.clear();
             stream.dts_offset = None;
+            stream.current_position = gst::ClockTime::ZERO;
+            stream.current_utc_time = gst::ClockTime::ZERO;
             stream.last_force_keyunit_time = None;
             stream.fragment_filled = false;
         }
