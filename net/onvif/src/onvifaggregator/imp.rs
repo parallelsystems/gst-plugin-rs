@@ -4,47 +4,17 @@ use gst::subclass::prelude::*;
 use gst_base::prelude::*;
 use gst_base::subclass::prelude::*;
 use gst_base::AGGREGATOR_FLOW_NEED_DATA;
-use minidom::Element;
 use once_cell::sync::Lazy;
-use std::collections::BTreeSet;
-use std::io::Cursor;
 use std::sync::Mutex;
 
 // Offset in nanoseconds from midnight 01-01-1900 (prime epoch) to
 // midnight 01-01-1970 (UNIX epoch)
 const PRIME_EPOCH_OFFSET: gst::ClockTime = gst::ClockTime::from_seconds(2_208_988_800);
 
-// Incoming metadata is split up frame-wise, and stored in a FIFO.
-#[derive(Eq, Clone)]
-struct MetaFrame {
-    // From UtcTime attribute, in nanoseconds since prime epoch
-    timestamp: gst::ClockTime,
-    // The frame element, dumped to XML
-    buffer: gst::Buffer,
-}
-
-impl Ord for MetaFrame {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.timestamp.cmp(&other.timestamp)
-    }
-}
-
-impl PartialOrd for MetaFrame {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for MetaFrame {
-    fn eq(&self, other: &Self) -> bool {
-        self.timestamp == other.timestamp
-    }
-}
-
 #[derive(Default)]
 struct State {
     // FIFO of MetaFrames
-    meta_frames: BTreeSet<MetaFrame>,
+    meta_frames: Vec<gst::Buffer>,
     // We may store the next buffer we output here while waiting
     // for a future buffer, when we need one to calculate its duration
     current_media_buffer: Option<gst::Buffer>,
@@ -132,6 +102,7 @@ impl ElementImpl for OnvifAggregator {
             .unwrap();
 
             let meta_caps = gst::Caps::builder("application/x-onvif-metadata")
+                .field("parsed", true)
                 .field("encoding", "utf8")
                 .build();
 
@@ -188,105 +159,39 @@ impl ElementImpl for OnvifAggregator {
 }
 
 impl OnvifAggregator {
-    // We simply consume all the incoming meta buffers and store them in a FIFO
-    // as they arrive
     fn consume_meta(
         &self,
         state: &mut State,
         element: &super::OnvifAggregator,
-    ) -> Result<(), gst::FlowError> {
-        while let Some(buffer) = self.meta_sink_pad.pop_buffer() {
-            let buffer = buffer.into_mapped_buffer_readable().map_err(|_| {
+        end: gst::ClockTime,
+    ) -> Result<bool, gst::FlowError> {
+        while let Some(buffer) = self.meta_sink_pad.peek_buffer() {
+            let meta_ts = self.lookup_reference_timestamp(&buffer).ok_or_else(|| {
                 gst::element_error!(
                     element,
                     gst::ResourceError::Read,
-                    ["Failed to map buffer readable"]
+                    ["Parsed metadata buffer should hold reference timestamp"]
                 );
 
                 gst::FlowError::Error
             })?;
 
-            let utf8 = std::str::from_utf8(buffer.as_ref()).map_err(|err| {
-                gst::element_error!(
-                    element,
-                    gst::StreamError::Format,
-                    ["Failed to decode buffer as UTF-8: {}", err]
-                );
-
-                gst::FlowError::Error
-            })?;
-
-            let root = utf8.parse::<Element>().map_err(|err| {
-                gst::element_error!(
-                    element,
-                    gst::ResourceError::Read,
-                    ["Failed to parse buffer as XML: {}", err]
-                );
-
-                gst::FlowError::Error
-            })?;
-
-            if let Some(analytics) =
-                root.get_child("VideoAnalytics", "http://www.onvif.org/ver10/schema")
-            {
-                for el in analytics.children() {
-                    // We are only interested in associating Frame metadata with video frames
-                    if el.is("Frame", "http://www.onvif.org/ver10/schema") {
-                        let timestamp = el.attr("UtcTime").ok_or_else(|| {
-                            gst::element_error!(
-                                element,
-                                gst::ResourceError::Read,
-                                ["Frame element has no UtcTime attribute"]
-                            );
-
-                            gst::FlowError::Error
-                        })?;
-
-                        let dt =
-                            chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|err| {
-                                gst::element_error!(
-                                    element,
-                                    gst::ResourceError::Read,
-                                    ["Failed to parse UtcTime {}: {}", timestamp, err]
-                                );
-
-                                gst::FlowError::Error
-                            })?;
-
-                        let prime_dt_ns = PRIME_EPOCH_OFFSET
-                            + gst::ClockTime::from_nseconds(dt.timestamp_nanos() as u64);
-
-                        let mut writer = Cursor::new(Vec::new());
-                        el.write_to(&mut writer).map_err(|err| {
-                            gst::element_error!(
-                                element,
-                                gst::ResourceError::Write,
-                                ["Failed to write back frame as XML: {}", err]
-                            );
-
-                            gst::FlowError::Error
-                        })?;
-
-                        gst::trace!(CAT, "Consuming metadata buffer {}", prime_dt_ns);
-
-                        state.meta_frames.insert(MetaFrame {
-                            timestamp: prime_dt_ns,
-                            buffer: gst::Buffer::from_slice(writer.into_inner()),
-                        });
-                    }
-                }
+            if meta_ts <= end {
+                let buffer = self.meta_sink_pad.pop_buffer().unwrap();
+                state.meta_frames.push(buffer);
+            } else {
+                return Ok(true);
             }
         }
 
-        Ok(())
+        Ok(self.meta_sink_pad.is_eos())
     }
 
     fn lookup_reference_timestamp(&self, buffer: &gst::Buffer) -> Option<gst::ClockTime> {
         for meta in buffer.iter_meta::<gst::ReferenceTimestampMeta>() {
             if meta.reference().is_subset(&NTP_CAPS) {
                 return Some(meta.timestamp());
-            }
-            if meta.reference().is_subset(&UNIX_CAPS) {
+            } else if meta.reference().is_subset(&UNIX_CAPS) {
                 return Some(meta.timestamp() + PRIME_EPOCH_OFFSET);
             }
         }
@@ -353,19 +258,13 @@ impl OnvifAggregator {
         }
     }
 
-    // Called after consuming metadata buffers, we consume the current media buffer
-    // and output it when:
-    //
-    // * it does not have a reference timestamp meta
-    // * we have timed out
-    // * we have consumed a metadata buffer for a future frame
     fn consume_media(
         &self,
         state: &mut State,
         element: &super::OnvifAggregator,
         timeout: bool,
-    ) -> Result<Option<(gst::Buffer, Option<gst::ClockTime>)>, gst::FlowError> {
-        if let Some(mut current_media_buffer) = state
+    ) -> Result<Option<gst::Buffer>, gst::FlowError> {
+        if let Some(current_media_buffer) = state
             .current_media_buffer
             .take()
             .or_else(|| self.media_sink_pad.pop_buffer())
@@ -373,88 +272,26 @@ impl OnvifAggregator {
             if let Some(current_media_start) =
                 self.lookup_reference_timestamp(&current_media_buffer)
             {
-                let duration =
-                    match self.media_buffer_duration(element, &current_media_buffer, timeout) {
-                        Some(duration) => {
-                            // Update the buffer duration for good measure, in order to
-                            // set a fully-accurate position later on in aggregate()
-                            {
-                                let buf_mut = current_media_buffer.make_mut();
-                                buf_mut.set_duration(duration);
-                            }
+                match self.media_buffer_duration(element, &current_media_buffer, timeout) {
+                    Some(duration) => {
+                        let end = current_media_start + duration;
 
-                            duration
-                        }
-                        None => {
+                        if self.consume_meta(state, element, end)? {
+                            Ok(Some(current_media_buffer))
+                        } else {
                             state.current_media_buffer = Some(current_media_buffer);
-                            return Ok(None);
+                            Ok(None)
                         }
-                    };
-
-                let end = current_media_start + duration;
-
-                if timeout {
-                    gst::debug!(
-                        CAT,
-                        obj: element,
-                        "Media buffer spanning {} -> {} is ready (timeout)",
-                        current_media_start,
-                        end
-                    );
-                    Ok(Some((current_media_buffer, Some(end))))
-                } else if self.meta_sink_pad.is_eos() {
-                    gst::debug!(
-                        CAT,
-                        obj: element,
-                        "Media buffer spanning {} -> {} is ready (meta pad is EOS)",
-                        current_media_start,
-                        end
-                    );
-                    Ok(Some((current_media_buffer, Some(end))))
-                } else if let Some(latest_frame) = state.meta_frames.iter().next_back() {
-                    if latest_frame.timestamp > end {
-                        gst::debug!(
-                            CAT,
-                            obj: element,
-                            "Media buffer spanning {} -> {} is ready",
-                            current_media_start,
-                            end
-                        );
-                        Ok(Some((current_media_buffer, Some(end))))
-                    } else {
-                        gst::trace!(
-                            CAT,
-                            obj: element,
-                            "Media buffer spanning {} -> {} isn't ready yet",
-                            current_media_start,
-                            end
-                        );
+                    }
+                    None => {
                         state.current_media_buffer = Some(current_media_buffer);
                         Ok(None)
                     }
-                } else {
-                    gst::trace!(
-                        CAT,
-                        obj: element,
-                        "Media buffer spanning {} -> {} isn't ready yet",
-                        current_media_start,
-                        end
-                    );
-                    state.current_media_buffer = Some(current_media_buffer);
-                    Ok(None)
                 }
             } else {
-                gst::debug!(
-                    CAT,
-                    obj: element,
-                    "Consuming media buffer with no reference NTP timestamp"
-                );
-
-                Ok(Some((current_media_buffer, gst::ClockTime::NONE)))
+                Ok(Some(current_media_buffer))
             }
         } else {
-            gst::trace!(CAT, obj: element, "No media buffer queued");
-
             Ok(None)
         }
     }
@@ -470,42 +307,14 @@ impl AggregatorImpl for OnvifAggregator {
 
         let mut state = self.state.lock().unwrap();
 
-        self.consume_meta(&mut state, element)?;
-
-        // When the current media buffer is ready, we attach all matching metadata buffers
-        // and push it out
-        if let Some((mut buffer, end)) = self.consume_media(&mut state, element, timeout)? {
+        if let Some(mut buffer) = self.consume_media(&mut state, element, timeout)? {
             let mut buflist = gst::BufferList::new();
 
-            if let Some(end) = end {
-                let mut split_at: Option<MetaFrame> = None;
+            {
                 let buflist_mut = buflist.get_mut().unwrap();
 
-                for frame in state.meta_frames.iter() {
-                    if frame.timestamp > end {
-                        gst::trace!(
-                            CAT,
-                            obj: element,
-                            "keeping metadata buffer at {} for next media buffer",
-                            frame.timestamp
-                        );
-                        split_at = Some(frame.clone());
-                        break;
-                    } else {
-                        gst::debug!(
-                            CAT,
-                            obj: element,
-                            "Attaching meta buffer {}",
-                            frame.timestamp
-                        );
-                        buflist_mut.add(frame.buffer.clone());
-                    }
-                }
-
-                if let Some(split_at) = split_at {
-                    state.meta_frames = state.meta_frames.split_off(&split_at);
-                } else {
-                    state.meta_frames.clear();
+                for frame in state.meta_frames.drain(..) {
+                    buflist_mut.add(frame);
                 }
             }
 

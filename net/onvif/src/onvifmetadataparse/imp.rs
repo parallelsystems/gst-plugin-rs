@@ -315,7 +315,7 @@ impl OnvifMetadataParse {
                 .build();
 
             let mut vec = Vec::new();
-            if let Err(err) = xml.write_to(&mut vec) {
+            if let Err(err) = xml.write_to_decl(&mut vec) {
                 gst::error!(CAT, obj: element, "Can't serialize XML element: {}", err);
                 continue;
             }
