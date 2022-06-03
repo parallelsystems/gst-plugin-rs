@@ -11,6 +11,7 @@ use gst::glib;
 
 mod onvifaggregator;
 mod onvifdepay;
+mod onvifmetadataparse;
 mod onvifoverlay;
 mod onvifpay;
 
@@ -19,6 +20,7 @@ fn plugin_init(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     onvifdepay::register(plugin)?;
     onvifaggregator::register(plugin)?;
     onvifoverlay::register(plugin)?;
+    onvifmetadataparse::register(plugin)?;
 
     gst::meta::CustomMeta::register("OnvifXMLFrameMeta", &[], |_, _, _, _| true);
 
